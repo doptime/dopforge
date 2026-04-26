@@ -1,0 +1,4 @@
+github.com/cespare/xxhash/v2 v2.2.0 h1:DC2CZ1Ep5Y4k3ZQ899DldepgrayRUGE6BBZ/cd9Cj44=
+github.com/cespare/xxhash/v2 v2.2.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
+github.com/doptime/dopharness v0.0.0-20260426115655-e66c2d982bde h1:l+A5SNRN+0V3yn8reE+zd/6Nn1qa6oF3S8HoXPaD4gI=
+github.com/doptime/dopharness v0.0.0-20260426115655-e66c2d982bde/go.mod h1:dj6kfAyx4PwqoPAI6lVHGamK7dFveDugDfOL58CfxD4=
