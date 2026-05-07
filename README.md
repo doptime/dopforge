@@ -1,107 +1,140 @@
 # dopforge
 
-> 用 SimpleTES 风格的 C×L×K 三轴搜索 + 多维 Pareto 评分,让 LLM 在你描述的目标上
-> 自己探索方法论实现路径,产出一组互不支配的精英解。
+> 用 SimpleTES 风格的 C×L×K 评估驱动搜索,迭代 Markdown 方法论文档。
 >
-> 底层修改引擎:[doptime/dopharness](https://github.com/doptime/dopharness)。
+> 底层修改引擎是 `dopharness`:它提供受控的 chunk 索引、三态上下文筛选和工具化编辑。
+> 从工程心智看,dopharness 接近 GenericAgent 的 Agent/ToolCall 循环,再叠加 AST/Markdown
+> chunk 化与失败回滚;dopforge 则把它放进评估驱动的搜索外循环。
 
-## 目录
+## 项目定位
 
-1. [它解决什么问题](#它解决什么问题)
-2. [核心思想](#核心思想)
-3. [包结构](#包结构)
-4. [快速开始](#快速开始)
-5. [dopharness 接口契约](#dopharness-接口契约)
-6. [设计理由](#设计理由)
-7. [已知改进项](#已知改进项)
-8. [v1 消融](#v1-消融)
+dopforge 不是某个具体“认字游戏”或“如何学习”的项目。它是一个**方法论迭代工具**:
 
----
+1. 用户给出一个方法论探索目标,例如“如何学习”“如何做产品调研”“如何做论文复现”。
+2. dopforge 维护多条并行 lineage,每条 lineage 迭代修改 Markdown 方法论文档。
+3. 每一代生成 K 个候选版本,通过硬门槛 + LLM 多维 judge 评价。
+4. 搜索内部用一个 weighted scalar proxy 做 SimpleTES 风格局部选择。
+5. 最终仍输出 Pareto Frontier,保留多目标互不支配的方法论版本供人类挑选。
 
-## 它解决什么问题
+这个分层很重要:
 
-dopharness 让 LLM 改代码不再幻觉,但单次修改的方向仍然由 LLM 拍脑袋决定。
-对于"造一个最佳认字游戏"这类**没有绝对评估标准**的开放式任务,单次拍脑袋远远不够——
-你需要让系统**并行探索许多方向**、**用多维评估筛掉显然差的**、把帕累托前沿留给人挑。
+- **框架意图**:方法论迭代引擎,写在代码、README 和默认 prompt 中。
+- **用户任务意图**:某次具体探索的目标、维度、硬门槛和运行目录,写在 `examples/<task>/goal.json` 中。
 
-dopforge 把这件事做了。它不告诉 LLM 怎么做,只告诉它"什么算好",然后开 C×L×K 路并行
-让它自己造、自己改、自己进化,最终给你一组互不支配的精英实现。
+## 与 SimpleTES 的对应关系
 
-## 核心思想
+SimpleTES 的核心不是“让模型想更久”,而是把 test-time compute 花在
+`propose -> evaluate -> refine` 的评估驱动循环上。dopforge 的对应如下:
 
-| 来源 | 思想 | dopforge 怎么用 |
-|---|---|---|
-| **SimpleTES** | C×L×K 三轴搜索 | 全局并行 C 路 + 局部精修 L 轮 + 海选 K 个挑赢家 |
-| **SimpleTES** | 轨迹级"奖励在终点" | `Lineage.BestEver` 跟踪 Pareto 历史峰,中途低分不致命,后代翻盘仍前沿 |
-| **dopharness** | 三态网关 + 外科修改 | 用作 Mutator;每个候选解一份 cp -a 隔离的 WorkDir |
-| **dopharness** | 4 层记忆 | L0/L2/L3 跨 lineage 共享,L4 per-candidate 随父代继承 |
-| **dopharness** | markdown chunk 化 | LLM 节级编辑 README/spec 文档,不必整篇重写 |
-| **Pareto 前沿** | 多目标决策 | 全程不强行加权;最终输出非支配集合,人工挑赢家 |
-| **早停** | 基线最优时停 | `StallAfter{N}` 检测 BestEver 不再扩张 ⇒ 提前释放 lineage 预算 |
+| SimpleTES 概念 | dopforge 对应 |
+|---|---|
+| Global width `C` | `Budget.C`: 并行 lineage 数 |
+| Refinement depth `L` | `Budget.L`: 每条 lineage 的迭代代数 |
+| Local samples `K` | `Budget.K`: 每代从同一父代生成 K 个候选 |
+| Proposal / refinement | `dopharness.Run` 通过工具修改 Markdown chunk |
+| Evaluator | `Pipeline`: hard gates + `LLMJudgeStage` |
+| Scalar score | `Score.Value(dimensions)`: 多维 LLM 分数的 weighted scalar proxy |
+| Local selection | `PickBestInBatch`: 在通过硬门槛的 K 个候选中选 scalar proxy 最高者 |
+| Best trajectory history | `Trajectory`: 记录每代 picked candidate、scalar proxy、soft vector 和 notes |
+| Diversity / final choice | `GlobalFrontier`: 合并各 lineage 的 Pareto 前沿 |
+
+与论文最大的差异是:论文中的很多任务有可靠的程序化标量评价,而方法论质量只能依赖
+LLM 多维启发式 judge。为了避免偏离 SimpleTES 的搜索动力,当前版本做了折中:
+
+- 搜索内部使用 `Score.Value` 作为稳定 scalar proxy,对齐 SimpleTES 的局部选择假设。
+- 最终输出仍使用 Pareto Frontier,避免把方法论质量过早压成单一分数。
+- hard gates 尽量保持确定性,用于防止 reward hacking,例如禁止生成 Go module、run.sh、Dockerfile 等工程脚手架。
 
 ## 包结构
 
-```
+```text
 dopforge/
-├── README.md                          ← 本文
-├── goal.go                            ← Goal: 描述"是什么/怎么算好",不写"怎么做"
-├── candidate.go                       ← Candidate + Score + Workspace
-├── evaluate.go                        ← Pipeline + ShellGate + LLMJudgeStage
-├── search.go                          ← Lineage + Pareto + Plateau + Trajectory + 主循环
-├── forge.go                           ← Forge 顶层门面 + SharedMemory
-├── cmd/dopforge/main.go               ← 开箱即用的入口程序(接 doptime/llm)
-└── examples/recognition_game/
-    └── goal.json                      ← 样例任务:认字游戏
+├── README.md
+├── goal.go                         # Goal、Dimension、HardGate
+├── candidate.go                    # Candidate、Score、Workspace
+├── evaluate.go                     # Pipeline、ShellGate、LLMJudgeStage
+├── search.go                       # C×L×K 主循环、scalar proxy、Pareto、Trajectory
+├── forge.go                        # Forge 门面、dopharness Mutator、SharedMemory
+├── main/
+│   └── main.go                     # CLI 入口,接 doptime/llm
+└── examples/
+    └── learning_methodology/
+        └── goal.json               # 示例任务:如何学习的方法论
 ```
 
-`cmd/dopforge/main.go` 是真正的入口,接 doptime/llm 跑得起来。换 LLM SDK 时
-只改这一个文件的 `buildCallers()`,其他不动。
+注意:项目根目录不再保留 `goal.json`,`main/goal.json` 也已删除。所有具体任务配置都放到
+`examples/<task>/goal.json`,避免框架意图和任务意图混淆。
 
-依赖:`github.com/doptime/dopharness`、`github.com/doptime/llm`。
+## 配置文件
 
----
+配置文件现在分成 `run` 和 `goal` 两层:
 
-## 快速开始
+```json
+{
+  "run": {
+    "name": "learning-methodology",
+    "work_dir": "./runs/learning-methodology",
+    "seed_dir": "./seeds/learning-methodology",
+    "artifact": "METHOD.md"
+  },
+  "goal": {
+    "description": "...",
+    "llm_judge_rubric": "...",
+    "dimensions": [
+      { "name": "clarity", "higher_is_better": true, "weight": 1.0 }
+    ],
+    "hard_gates": [
+      { "name": "artifact_exists", "cmd": ["bash", "-c", "test -f METHOD.md"], "timeout": "5s" }
+    ]
+  }
+}
+```
+
+`run.work_dir` 用来集中存放全部中间结果,包括候选目录、共享 skills 和 trajectory:
+
+```text
+runs/<name>/
+├── L0/c00001/...
+├── L1/c00002/...
+├── .shared/skills/...
+└── trajectory.json
+```
+
+命令行参数可以覆盖配置文件:
 
 ```bash
-# 1. 写一份 goal.json(或者用 examples/recognition_game/goal.json 试水)
-cp examples/recognition_game/goal.json ./goal.json
+go run ./main -config ./examples/learning_methodology/goal.json
 
-# 2. 准备种子目录(没有就让 main 自动放一个最小 stub)
-mkdir -p ./seed
-
-# 3. 跑一个最小预算的搜索验证管道
-go run ./cmd/dopforge \
-    -goal ./goal.json \
-    -seed ./seed \
-    -work ./.forge_work \
-    -C 2 -L 2 -K 2
-
-# C=2 L=2 K=2 = 8 次 mutate,大约消耗 8 次主模型调用 + 8 次 judge 调用 +
-# 16 次 triage 调用。看 ./.forge_work/trajectory.json 确认管道通了再放大。
-
-# 4. 通了之后放大到正式预算
-go run ./cmd/dopforge -goal ./goal.json -C 4 -L 6 -K 3
+go run ./main \
+  -config ./examples/learning_methodology/goal.json \
+  -work ./runs/learning-methodology-exp2 \
+  -C 4 -L 6 -K 3
 ```
 
-输出:`./.forge_work/L*/c*****/` 每个目录是一份候选实现。命令行最后会打印
-帕累托前沿的几条候选 + 它们的多维评分。**人工挑一个**。
+优先级:
 
----
+```text
+命令行参数 > 配置文件 run 字段 > 默认值
+```
+
+为了兼容旧版本,`-goal` 仍可作为 `-config` 的别名,但新代码和文档都推荐使用 `-config`。
+
+## 运行方式
+
+```bash
+# 最小预算验证流程
+go run ./main -config ./examples/learning_methodology/goal.json -C 2 -L 2 -K 2
+
+# 放大探索
+go run ./main -config ./examples/learning_methodology/goal.json -C 4 -L 6 -K 3
+```
+
+如果 `run.seed_dir` 为空或不存在 Markdown 文件,CLI 会创建一个最小 `METHOD.md` 种子。
+它不会创建 `go.mod`、`main.go`、`run.sh` 或任何沙盒运行环境。
 
 ## dopharness 接口契约
 
-> 集成 dopforge 不需要看 dopharness 源码;以下是稳定 API 摘要。
-
-### 心智模型
-
-dopharness 给 LLM 提供**幻觉最小化的代码修改环境**:项目按 AST 切成 chunk,
-小模型先做三态裁定(FULL/SKELETON/IGNORE),大模型只能通过有语法校验的 ToolCall
-改代码,失败回滚、最多重试 3 轮。
-
-集成方关心的是它的 IO:**喂一段自然语言任务 → 拿到一份 RunReport,工程文件就地改完**。
-
-### 顶层入口
+集成方只需要关心稳定入口:
 
 ```go
 // 包路径 github.com/doptime/dopharness/harness
@@ -109,145 +142,66 @@ type Harness struct{ /* opaque */ }
 
 func New(cfg Config) (*Harness, error)
 func (h *Harness) Index(ctx) (*index.Report, error)
-func (h *Harness) BuildContext(userPrompt) (*BuildContextResult, error)
 func (h *Harness) AsLLMTools(builder tools.ToolBuilder) []any
 func (h *Harness) Run(ctx, userPrompt) (*RunReport, error)
 func (h *Harness) Memory() *memory.Memory
 ```
 
-**生命周期**:`New → Index → AsLLMTools(builder) → Run`(可重复)。
-`Run` 必须在 `AsLLMTools` 之后调用;两者与 `Index` 互斥。
+生命周期:
 
-### 三类 Caller(集成方实现)
+```text
+New -> Index -> AsLLMTools(builder) -> Run
+```
 
-dopharness 不绑定任何 LLM 客户端库,集成方桥接以下函数:
+三类 LLM caller:
 
 ```go
 // gateway 包
 type TriageCaller func(p TriagePromptParams, sink func(*TriageDecisionPayload)) error
-type ExpandCaller func(p ExpandPromptParams,  sink func(*ExpandDecisionPayload))  error
+type ExpandCaller func(p ExpandPromptParams, sink func(*ExpandDecisionPayload)) error
 
 // harness 包
 type MainCaller func(systemPrompt, userPrompt string, tools []any) error
 ```
 
-dopforge 在 `cmd/dopforge/main.go` 给出了接 doptime/llm 的完整桩;换 SDK 复用
-那一文件的结构即可。
-
-### 工具桥接
+工具桥接:
 
 ```go
 type ToolBuilder interface {
-    Build(name, desc string, handler any) any  // 返回 LLM SDK 的 Tool 对象
+    Build(name, desc string, handler any) any
 }
 ```
 
-dopharness 默认暴露 7 个工具(modify_chunk / delete_chunk / add_chunk /
-create_file / delete_file / read_chunk / search_chunks_by_name)。
-markdown 文件用相同的工具集编辑,无需特殊处理。
+dopharness 默认暴露 `modify_chunk / delete_chunk / add_chunk / create_file / delete_file /
+read_chunk / search_chunks_by_name`。dopforge 的 prompt 会约束这些工具只用于 Markdown 方法论文档。
 
-### Memory 4 层
+## 设计原则
 
-```go
-type Memory struct {
-    L0 Layer  // Meta Rules     (system prompt, 永久规则)
-    L1 Layer  // Insight Index  (gateway 产出的三态 chunk)
-    L2 Layer  // Global Facts   (项目级稳定事实)
-    L3 Layer  // Task Skills    (可复用 SOP, 从目录加载 .md)
-    L4 Layer  // Session Records(历史会话)
-}
-```
+### 1. 搜索内部需要 scalar proxy
 
-L0/L2/L3/L4 都是导出字段,集成方可以**直接覆盖**(dopforge 的 SharedMemory 就这么做)。
-L1 由 gateway 自动产出,不要碰。
+SimpleTES 的局部选择依赖可比较分数。方法论任务没有天然程序化评分,但如果完全只用 Pareto,
+K 内选择会过于松散,停滞判断也会不稳定。因此当前版本将多维 LLM judge 分数通过
+`Score.Value(dimensions)` 转成 weighted scalar proxy,用于局部选择和 trajectory。
 
-### 关键不变量
+### 2. 最终结果保留 Pareto Frontier
 
-1. **就地修改**:`Run` 成功后 `ProjectRoot` 下源码已改写,无 staging
-2. **失败回滚**:`Run` 失败时部分修改仍在;dopforge 通过 cp -a 副本天然解决
-3. **chunk store 同步**:`Run` 成功后 `.dopharness/` 与磁盘一致;下次 Index 增量
-4. **隔离**:dopharness 不写 ProjectRoot 之外的文件
+方法论质量天然多目标:清晰、可执行、深度、适配性、Markdown 质量不一定同向。最终仍输出
+Pareto 前沿,避免唯一标量把候选过早压扁。
 
----
+### 3. Hard gates 用来防 reward hacking
 
-## 设计理由
+LLM judge 是启发式评价,容易被格式、话术或无关工程脚手架欺骗。因此默认示例用确定性 shell
+检查约束产物:
 
-四个反常识的决定,逐一解释:
+- 必须有 `METHOD.md`
+- 必须有基本 Markdown 结构
+- 顶层只能有 Markdown 文件
+- 不能生成 `go.mod/main.go/run.sh/package.json/Dockerfile`
 
-**1. 不强行返回标量奖励。** 多目标评估天然是启发式的,折成单分等于把启发式偏见
-注入选择压力。dopforge 全程多维向量,只在 PickBestInBatch 内 tiebreak 时用一次
-加权,且仅作用于 batch 内,不影响全局前沿。
+### 4. 运行目录属于任务配置
 
-**2. 不在 lineage 之间做产量归一化。** 你可能直觉想奖励"产量稳定"的 lineage,
-但这会惩罚"长期低分突然翻盘"的探索路径——而那种路径恰好是 SimpleTES 论文里 21 个
-突破中最常见的来源。让 lineage 之间互不打架,只在全局 Pareto 前沿这一层汇合。
-
-**3. 不强制 Elo / 排名机制。** 之前版本设计过多维 Elo + 锚点 + 毕业制,跑了一轮
-分析发现:LLMJudgeStage 已经直接产多维 [0,1] 分,Pareto 直接消费这些分就够了。
-Elo 只是"对法官打分稳定性的兜底",在多数场景下是过度防御。砍掉。
-
-**4. 早停优于全跑完。** 一条 lineage 在第 3 代就已达到它的最优形态后,后续 K 个孩子
-怎么 mutate 都比不过,这种情况下继续跑就是浪费。`StallAfter{N: 3}` 检测 BestEver
-连续 N 代不扩张就停,把预算让给还在前进的 lineage。
-
----
-
-## 已知改进项
-
-跑得起来,但有两处明显低效。等遇到瓶颈了再改:
-
-### 改进 1:法官评估应该用 chunk diff,不应该整文件喂
-
-**现状**:`LLMJudgeStage` 通过 `FilesToInclude` 把候选解 WorkDir 整目录读出来,
-每个文件 4KB 截断后塞给法官 prompt。这有两个代价——
-法官每代都重看 80% 不变的内容(评分噪声盖过实际改动信号),且 token 占用上不去。
-
-**应该改成**:
-- 父代评估时:整文件喂(基线评分)
-- 子代评估时:只喂 dopharness chunk store 中**与父代不同的 chunk**(diff 评分)
-
-dopharness 的 chunk store 已经按文件 + ID 索引,能直接 diff `parent.WorkDir/.dopharness/chunks.json`
-和 `child.WorkDir/.dopharness/chunks.json`。**markdown chunk 化在这里立刻发挥价值**——
-README 改了一个 H2 节,只把那个 chunk 喂给法官,而不是整个 README。
-
-代码改造点:`evaluate.go` 的 `LLMJudgeStage.Run` 加一个 `Parent` 参数,
-`buildJudgePrompt` 加 diff 段。约 50 行。
-
-### 改进 2:种子代不应该跑 C 次相同的评估
-
-**现状**:`search.go` gen=0 阶段每个 lineage 各 NewCandidate 一个 seed,各自
-Materialize(各自 cp 一份 SeedDir),各自 Pipeline.Evaluate。**C 次评估的结果完全相同**,
-浪费 C-1 次 LLM 调用。
-
-**应该改成**:
-- 跑 1 次 seed 评估
-- 让所有 lineage 的 history[0] 共享这个 seed candidate
-- 注意:`Workspace.Cleanup` 此时不能动 seed.WorkDir(否则其他 lineage 失去拷贝源)
-
-代码改造点:`search.go` gen=0 块,约 30 行。
-
----
-
-## v1 消融
-
-从早期设计到当前版本砍掉的:
-
-| 砍掉的组件 | 行数 | 砍掉理由 |
-|---|---:|---|
-| 多维 Elo + 锚点 + 毕业制 | ~390 | LLMJudge 已直接产多维分,Pareto 直接消费就够 |
-| SyntheticPlayer Stage 桩 | ~50 | 高度业务相关;用户实现 Stage 接口自己加 |
-| AbsoluteFloor + CombinedPolicy | ~60 | 策略组合糖,实战很少用 |
-| Trajectory 完整版(含 child snapshot) | ~50 | 简化为只记 picks + frontier 已够 debug |
-
-**剩下的都是承重墙**。再砍要伤设计了。
-
-未来扩展点(蓄意没做):
-
-- **trajectory-level post-training**:SimpleTES 第二大贡献。dopforge 不训练模型,
-  但 trajectory.json 的 schema 已预留;可以单独起 forge_train 项目消费它。
-- **跨 lineage 受精**:让 lineage A 的 winner 被 lineage B 拷贝继续演化。
-  evolutionary 算法常见做法,但会复杂化轨迹分析,v1 不做。
-- **K 自适应**:K 在 lineage 进步快时减小、停滞时增大。可以做但收益不确定。
+多项目探索时,中间结果必须隔离。`run.work_dir` 进入配置文件后,每个探索项目都可以拥有独立
+`runs/<name>` 目录,不会互相覆盖。
 
 ## 许可
 

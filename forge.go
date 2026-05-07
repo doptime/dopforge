@@ -21,10 +21,8 @@ import (
 // Forge:dopforge 对外的最终门面
 // ============================================================
 //
-// 一个 Forge 实例聚合 Goal、Workspace、Pipeline、SharedMemory、和 dopharness
-// 三个 Caller。Forge.Run 把这一切串成一次 RunSearch 调用。
-//
-// 用户视角的最小用法见 README.md 末尾的 Example。
+// 一个 Forge 实例聚合 Goal、Workspace、Pipeline、SharedMemory 和 dopharness Caller。
+// Forge.Run 把这一切串成一次 C×L×K 方法论迭代搜索。
 
 type Forge struct {
 	cfg       Config
@@ -36,18 +34,18 @@ type Config struct {
 	Goal *Goal
 
 	// SeedDir:第一代候选解从这里 cp -a。空则白板起步。
-	// 典型用法:放一个最小可运行的"骨架项目"作为种子,LLM 在其上演化。
+	// 对方法论任务,推荐放一个只包含 METHOD.md 的最小种子目录。
 	SeedDir string
 
 	// WorkRoot:所有候选解工作目录的根。会自动创建。
 	WorkRoot string
 
-	// dopharness 的三个 Caller(详见 README.md "dopharness 接口契约")
+	// dopharness 的三个 Caller。
 	TriageCaller gateway.TriageCaller
 	ExpandCaller gateway.ExpandCaller // 可空(EnableExpand=false 时)
 	MainCaller   harness.MainCaller
 
-	// EnableExpand 透传给 dopharness。默认 false(对短任务 Pass2 收益不大)。
+	// EnableExpand 透传给 dopharness。默认 false。
 	EnableExpand bool
 
 	// ToolBuilder 桥接 dopharness 工具到具体 LLM SDK。
@@ -56,14 +54,12 @@ type Config struct {
 	// Pipeline 是评估器(必填)。
 	Pipeline *Pipeline
 
-	// SharedMemory 接入 dopharness 的 L0/L2/L3 记忆,所有 candidate 共享
-	// 迭代纪律 + Goal 事实 + 跨 lineage 的 skill 集合。强烈推荐启用。
-	// 留 nil 则不接,等价于 dopharness 默认 memory(每个 candidate 失忆症)。
+	// SharedMemory 接入 dopharness 的 L0/L2/L3 记忆,所有 candidate 共享迭代纪律、
+	// Goal 事实和跨 lineage 的方法论改进 SOP。强烈推荐启用。
 	SharedMemory *SharedMemory
 
-	// SkillDistiller 在某 candidate 进入 lineage BestEver 时被调用,蒸馏成
-	// 一篇 skill 写进共享 SkillsDir。后续所有 lineage 下一代 Run 都能在
-	// <task_skills> 看到。留 nil 则只写 L4 不写 L3。
+	// SkillDistiller 在某 candidate 进入 lineage BestEver 时被调用,把有效改法蒸馏成
+	// 一篇 .md skill 写入共享 SkillsDir。
 	SkillDistiller SkillDistiller
 
 	Logger func(event string, fields map[string]any)
@@ -104,7 +100,7 @@ func New(cfg Config) (*Forge, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.Pipeline.Goal = cfg.Goal // 让 Pipeline 知道维度做兜底
+	cfg.Pipeline.Goal = cfg.Goal
 
 	return &Forge{cfg: cfg, workspace: ws}, nil
 }
@@ -144,16 +140,15 @@ func (f *Forge) Run(ctx context.Context, b Budget) (*SearchResult, error) {
 func defaultStallN(L int) int {
 	switch {
 	case L <= 4:
-		return 2
-	case L <= 8:
 		return 3
-	default:
+	case L <= 8:
 		return 4
+	default:
+		return 5
 	}
 }
 
-// makeMutator 把 dopharness 包成 Mutator。这是 dopforge 与 dopharness 的**唯一**
-// 接触面;所有其他代码都不知道下面是 dopharness 还是别的修改引擎。
+// makeMutator 把 dopharness 包成 Mutator。这是 dopforge 与 dopharness 的唯一接触面。
 func (f *Forge) makeMutator() Mutator {
 	return func(ctx context.Context, child, parent *Candidate) error {
 		hcfg := harness.Config{
@@ -198,25 +193,32 @@ func (f *Forge) makeMutator() Mutator {
 }
 
 func buildMutatorPrompt(g *Goal, parent *Candidate, memoryActive bool) string {
+	_ = memoryActive // 保留参数以维持兼容签名;goal 一律写入 prompt
 	var sb strings.Builder
-	if !memoryActive {
-		// 没启用记忆,在 user prompt 里也带上目标
-		sb.WriteString("<goal>\n")
-		sb.WriteString(g.Description)
-		sb.WriteString("\n</goal>\n\n")
-	}
+	sb.WriteString("<goal>\n")
+	sb.WriteString(g.Description)
+	sb.WriteString("\n</goal>\n\n")
 	if parent != nil && parent.Score != nil && parent.Score.Notes != "" {
 		sb.WriteString("<previous_evaluation>\n")
-		sb.WriteString("Your previous version was scored. Below is the judge's feedback. ")
-		sb.WriteString("Make a substantive improvement — not a cosmetic change.\n\n")
+		sb.WriteString("Your previous methodology document was scored. Below is the judge's feedback. ")
+		sb.WriteString("Make a substantive improvement, not a cosmetic change.\n\n")
 		sb.WriteString(parent.Score.Notes)
 		sb.WriteString("\n</previous_evaluation>\n\n")
 	}
+	sb.WriteString("<anti_patterns>\n")
+	sb.WriteString("- Renaming, reordering, or reformatting sections without changing what they teach\n")
+	sb.WriteString("- Sprinkling terminology (元认知, 迁移, 刻意练习, 抗遗忘, 反馈闭环) without procedures, examples, or templates that operationalize them\n")
+	sb.WriteString("- Replacing concrete examples or templates with abstract principles\n")
+	sb.WriteString("- Padding with bullet lists where prose, tables, or worked examples would teach more\n")
+	sb.WriteString("</anti_patterns>\n\n")
 	sb.WriteString("<instruction>\n")
-	sb.WriteString("Make changes to the project to better satisfy the goal. ")
-	sb.WriteString("Use the provided tools (modify_chunk, create_file, ...). ")
-	sb.WriteString("You may make multiple tool calls in this turn. ")
-	sb.WriteString("Aim for a meaningful improvement; small tweaks rarely move the needle.")
+	sb.WriteString("Improve the methodology Markdown document to better satisfy the goal. ")
+	sb.WriteString("The desired output is documentation only, preferably a single METHOD.md unless the goal says otherwise. ")
+	sb.WriteString("Do not create source code, Go modules, shell scripts, package manifests, Dockerfiles, test runners, sandboxes, or runnable applications. ")
+	sb.WriteString("Use the provided tools only to edit Markdown content and supporting Markdown notes. ")
+	sb.WriteString("If you create a file, create only .md/.markdown files. ")
+	sb.WriteString("Make a meaningful improvement to structure, concepts, examples, checklists, tradeoffs, anti-patterns, or review loops. ")
+	sb.WriteString("Prefer precise sections, operational procedures, and reusable methodology over generic inspirational prose. ")
 	sb.WriteString("\n</instruction>")
 	return sb.String()
 }
@@ -224,47 +226,38 @@ func buildMutatorPrompt(g *Goal, parent *Candidate, memoryActive bool) string {
 // ============================================================
 // SharedMemory:接入 dopharness 4 层记忆,真正解锁跨 lineage 学习
 // ============================================================
-//
-// 默认情况下每个 candidate 的 .dopharness/memory/ 是独立的,L0/L2 空、L3 不共享、
-// L4 各自一份。这样 dopforge 跑起来就是失忆症患者重新工作。
-//
-// 接好 SharedMemory 后:
-//   L0  共享的 dopforge 迭代纪律 ───┐
-//   L2  从 Goal 渲染的事实           ├── 进每个 candidate 的每次 Run
-//   L3  共享的 skills 目录           ┘
-//   L4  per-candidate sessions ── cp -a 自动随父代继承,Forge 写新一轮总结
-//
-// 关键的 L3 是跨 lineage 的学习渠道:某 lineage 突破时蒸馏成 .md skill 写进
-// 共享目录,其他 lineage 下一代自动看到。
 
-const dopforgeMetaRules = `# dopforge iteration rules
+const dopforgeMetaRules = `# dopforge methodology iteration rules
 
-You are operating inside a search loop. Your output will be evaluated, scored,
-and either advanced as the next generation or discarded. Treat this seriously.
+You are operating inside a methodology-document search loop. Your output will be
+evaluated, scored, and either advanced as the next generation or discarded.
 
-1. **Address concrete critique first.** If <previous_evaluation> is present,
-   the judge's notes name specific issues at file:line. Fix those before
-   pursuing your own ideas.
+1. **Documentation only.** The target artifact is methodology Markdown. Do not
+   create runnable software projects, Go modules, shell scripts, sandboxes,
+   package manifests, Dockerfiles, test runners, or app scaffolding unless the
+   goal explicitly asks for them.
 
-2. **Substantive over cosmetic.** Renaming variables, reformatting, or adding
-   comments rarely moves the score. Make a real change to behavior, structure,
-   or coverage.
+2. **Address concrete critique first.** If <previous_evaluation> is present,
+   the judge's notes name specific gaps. Fix those before pursuing new ideas.
 
-3. **Don't undo prior progress** unless you can articulate why the previous
-   direction was wrong. The score history is in <task_skills> and L4 sessions —
-   read them before reverting.
+3. **Substantive over cosmetic.** Renaming sections, reformatting, or adding
+   motivational prose rarely moves the score. Improve conceptual structure,
+   decision procedures, examples, exercises, feedback loops, or failure modes.
 
-4. **Multiple tool calls in one turn are normal.** A meaningful improvement
-   often spans 3-10 modify_chunk + create_file calls.
+4. **Preserve useful prior structure.** Do not undo prior progress unless you
+   can articulate why the previous direction was wrong. Read task skills and L4
+   session records before reverting.
 
-5. **When stuck, search.** If <project_context> looks too thin, use
-   search_chunks_by_name and read_chunk to expand your view before editing.
+5. **Use tools surgically.** Multiple markdown chunk edits are normal. Prefer
+   modifying or adding focused sections over rewriting the whole document.
+
+6. **When stuck, search.** If <project_context> is thin, use search/read tools to
+   inspect existing Markdown before editing.
 `
 
 // SharedMemoryConfig 是构造共享记忆的输入。
 type SharedMemoryConfig struct {
 	// SkillsDir 是 L3 共享技能目录的绝对路径。所有 candidate 共用此目录。
-	// 推荐 <WorkRoot>/.shared_memory/skills。
 	SkillsDir string
 	// MetaRulesOverride 替换默认 dopforgeMetaRules。空则用默认。
 	MetaRulesOverride string
@@ -273,9 +266,6 @@ type SharedMemoryConfig struct {
 }
 
 // SharedMemory 是被注入到每个 dopharness Harness 的 L0/L2/L3。
-//
-// 持有的层是只读共享的(同一份 *Layer 指针被多个 Harness 引用)——这没问题,
-// dopharness 的 Layer 实现都是 sync.RWMutex 保护的。
 type SharedMemory struct {
 	cfg SharedMemoryConfig
 
@@ -314,9 +304,6 @@ func NewSharedMemory(cfg SharedMemoryConfig) (*SharedMemory, error) {
 }
 
 // ApplyTo 把共享层覆盖到一个 Harness 的 Memory 上。
-//
-// 覆盖 L0/L2/L3,**保留** L4 默认实现 —— 因为 L4 必须 per-WorkDir,
-// Workspace 的 cp -a 才能让 parent 的 sessions 自动继承给 child。
 func (s *SharedMemory) ApplyTo(h *harness.Harness) {
 	mem := h.Memory()
 	if mem == nil {
@@ -327,10 +314,7 @@ func (s *SharedMemory) ApplyTo(h *harness.Harness) {
 	mem.L3 = s.l3
 }
 
-// RecordSkill 把"什么改动有效"的总结写进共享 SkillsDir。
-//
-// key 用来生成稳定文件名(同 key 重复写覆盖)。content 应当是 markdown,
-// 第一行最好是 `# <when this applies>`,后接一段简短 SOP。
+// RecordSkill 把“什么改动有效”的总结写进共享 SkillsDir。
 func (s *SharedMemory) RecordSkill(key, content string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -341,7 +325,6 @@ func (s *SharedMemory) RecordSkill(key, content string) error {
 }
 
 // SessionRecord 把一段迭代摘要写进 candidate 自己的 L4。
-// 下一代 cp -a 父代时自动把 sessions 带过去,父代→子代有真实对话史。
 func (s *SharedMemory) SessionRecord(c *Candidate, summary string) error {
 	if c.WorkDir == "" {
 		return fmt.Errorf("session_record: candidate %s has no WorkDir", c.ID)
@@ -355,14 +338,10 @@ func (s *SharedMemory) SessionRecord(c *Candidate, summary string) error {
 	return os.WriteFile(filepath.Join(dir, fname), []byte(summary), 0o644)
 }
 
-// SkillDistiller 是用户提供的"看 winner 的产出蒸馏出 skill 文本"的回调。
-//
-// 实现可以很简单:让 LLM 看 git diff parent..winner + winner.Score.Notes,
-// 要求它写一段"在什么情况下这种改法管用"的 SOP。
+// SkillDistiller 是用户提供的“看 winner 的产出蒸馏出 skill 文本”的回调。
 type SkillDistiller func(ctx context.Context, winner, parent *Candidate) (key, content string, err error)
 
 // MaybeRecordSkill 在 winner 进入 BestEver 时蒸馏成 skill。
-// distiller 为 nil 时只做 SessionRecord(L4),不做 RecordSkill(L3)。
 func (s *SharedMemory) MaybeRecordSkill(
 	ctx context.Context, winner, parent *Candidate, distiller SkillDistiller,
 ) error {
@@ -386,11 +365,10 @@ func (s *SharedMemory) MaybeRecordSkill(
 	return s.RecordSkill(key, content)
 }
 
-// renderGoalAsFacts 把 Goal 序列化成一段 L2 风格的事实文本。
-// 这一段会作为 system prompt 的一部分进每次 Run,LLM 每代都被显式提醒目标。
+// renderGoalAsFacts 把 Goal 序列化成 L2 风格的事实文本。
 func renderGoalAsFacts(g *Goal) string {
 	var sb strings.Builder
-	sb.WriteString("# Project Goal\n\n")
+	sb.WriteString("# Methodology Goal\n\n")
 	sb.WriteString(g.Description)
 	sb.WriteString("\n\n# Evaluation Dimensions\n\n")
 	for _, d := range g.Dimensions {
@@ -418,9 +396,7 @@ func sanitizeSkillFilename(key string) string {
 	var clean strings.Builder
 	for _, r := range key {
 		switch {
-		case r >= 'a' && r <= 'z',
-			r >= 'A' && r <= 'Z',
-			r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
 			clean.WriteRune(r)
 		case r == '_' || r == '-' || r == ' ':
 			clean.WriteRune('_')

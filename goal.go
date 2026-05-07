@@ -1,39 +1,37 @@
 // Package dopforge 是 dopharness 之上的方法论搜索引擎。
 //
-// 核心思想:你描述"想造什么"和"怎么算好"(Goal),不描述实现路径;dopforge 用
-// SimpleTES 风格的 C×L×K 三轴搜索 + 多维 Pareto 评分驱动 LLM 自己探索具体实现,
-// 最终给你一组互不支配的精英解。
+// 核心思想:你描述“想得到什么方法论”和“怎么算好”(Goal),不描述具体写法;
+// dopforge 用 SimpleTES 风格的 C×L×K 三轴搜索 + 多维 Pareto 评分驱动 LLM
+// 对 Markdown 方法论文档进行多路线迭代,最终给你一组互不支配的精英版本。
 //
-// 五个文件、单一包:
-//   goal.go      —— 描述任务:意图、维度、硬门槛
-//   candidate.go —— 候选解的身份、分数、独立工作目录管理
-//   evaluate.go  —— 四道闸评估器:硬门槛 + LLM 多维法官
-//   search.go    —— C×L×K 主循环 + Pareto 前沿 + 停滞检测 + 轨迹记录
-//   forge.go     —— 顶层门面 + 跨 lineage 共享记忆(接 dopharness 4 层)
+// 文件分工:
 //
-// 见 README.md 了解 dopharness 的接口契约和使用步骤。
+//	goal.go      —— 描述任务:意图、维度、硬门槛
+//	candidate.go —— Candidate + Score + Workspace
+//	evaluate.go  —— Pipeline + ShellGate + LLMJudgeStage
+//	search.go    —— C×L×K 主循环 + Pareto 前沿 + 停滞检测 + 轨迹记录
+//	forge.go     —— Forge 顶层门面 + 跨 lineage 共享记忆
 package dopforge
 
 // Goal 是用户唯一必须仔细写的东西。
 //
-// 设计哲学:在这里描述"是什么"和"怎么算好",**不**描述"怎么做"。后者完全交给搜索
-// 引擎自己探索。如果你忍不住想在 Description 里写"先实现 X 然后 Y",删掉那段——
-// 它会把整个搜索锁死在你预想的路径上。
+// 设计哲学:在这里描述“是什么”和“怎么算好”,不描述“怎么写”。
+// 后者交给搜索引擎探索。对于方法论任务,Description 应明确输出物、读者、
+// 禁区和风格边界,例如:“输出单个 METHOD.md;不要生成代码项目或运行脚本”。
 type Goal struct {
 	// Description 是给 LLM 看的自然语言意图。
-	// 应当包含:目的、风格偏好、参考样例、显式禁区,但不写实现路径。
+	// 应当包含:主题、目标读者、输出形态、风格偏好、显式禁区。
 	Description string
 
-	// HardGates 是一组硬门槛。任何一条不通过,候选解直接被丢弃。
-	// 例:能编译、能启动、单局 30 秒内结束、不读外部网络。
+	// HardGates 是一组硬门槛。任何一条不通过,候选解不会进入 Pareto 前沿。
+	// 对方法论文档任务,典型门槛是:METHOD.md 存在、非空、没有 go.mod/run.sh 等工程文件。
 	HardGates []HardGate
 
-	// Dimensions 声明了多维评分轴及方向。评估器返回的 Soft map 必须覆盖这里
-	// 的所有维度。搜索本身不依赖 Weight,Weight 只在 PickBestInBatch 多个非
-	// 支配候选并列时用作 tiebreak。
+	// Dimensions 声明多维评分轴及方向。评估器返回的 Soft map 必须覆盖这里的所有维度。
+	// 搜索本身不依赖 Weight,Weight 只在同 batch 多个非支配候选并列时做 tiebreak。
 	Dimensions []Dimension
 
-	// LLMJudgeRubric 给 LLM 法官看的评分细则。空则不启用法官单点评分。
+	// LLMJudgeRubric 给 LLM 法官看的评分细则。空则不启用 LLM 软评分。
 	LLMJudgeRubric string
 }
 
@@ -46,8 +44,8 @@ type Dimension struct {
 
 // HardGate 是一条硬门槛检查器。
 //
-// 实现方拿到候选解的 workDir,自己决定怎么验证。返回 nil 即视作通过。
-// 典型:在 workDir 里 go build / npm test / docker run --rm,看退出码。
+// 实现方拿到候选解的 workDir,自己决定怎么验证。返回 nil 即通过。
+// 对文档任务,建议尽量使用轻量、确定性的 shell 检查,而不是运行沙盒。
 type HardGate interface {
 	Name() string
 	Check(workDir string) error

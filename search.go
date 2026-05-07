@@ -15,35 +15,35 @@ import (
 // Lineage:C 路并行的某一路
 // ============================================================
 //
-// 每个 L 步骤里:在 Latest() 上拷出 K 份 → 各自 mutate → 从 K 个孩子里挑最好,
-// Append 推进 lineage。
+// 每个 L 步骤里:在 Latest() 上拷出 K 份 → 各自 mutate → 评价 → 从 K 个孩子里
+// 用 SimpleTES 风格 scalar proxy 挑赢家,Append 推进 lineage。
 //
-// SimpleTES 论文中"轨迹级奖励"的本地落地:BestEver 不是当前主干,而是 Pareto
-// 历史峰值集合。某代主干被劣质孩子带偏不要紧,只要后代翻盘,峰值仍在 BestEver。
-// PlateauPolicy 据此判断 lineage 是否真的停滞,而非简单看主干分数。
+// BestEver 仍保存 Pareto 历史峰值集合,用于最终给人类保留多种互不支配的方法论版本。
+// bestValue 则保存该 lineage 的历史最高 scalar proxy,用于停滞判断和日志。
 
 type Lineage struct {
 	ID int
 
 	mu      sync.Mutex
-	history []*Candidate // history[0] 是种子,后续每代追加一个"当代赢家"
+	history []*Candidate // history[0] 是种子,后续每代追加一个“当代赢家”
 
 	// BestEver 是这条 lineage 的 Pareto 历史峰值集合(可能多个非支配点)。
 	BestEver []*Candidate
 
-	// lastImprovementGen 记录最近一次 BestEver 扩张时的代数。
-	// PlateauPolicy.StallAfter 据此判断停滞。
+	// bestValue 是该 lineage 历史最高 scalar proxy。
+	bestValue float64
+
+	// lastImprovementGen 记录最近一次 scalar proxy 或 Pareto 前沿扩张的代数。
 	lastImprovementGen int
 
 	// stopped 由 search.RunSearch 在 Plateau 命中时设置,后续代不再生成孩子。
 	stopped bool
 
-	// OnImprovement 在 Append 检测到 BestEver 扩张时被调用(在锁外)。
-	// 典型用途:Forge 蒸馏 skill 写共享 L3 记忆。回调应快速,慢操作请异步处理。
+	// OnImprovement 在 Append 检测到 BestEver 扩张或 scalar proxy 改进时被调用(在锁外)。
 	OnImprovement func(c *Candidate)
 }
 
-func NewLineage(id int) *Lineage { return &Lineage{ID: id} }
+func NewLineage(id int) *Lineage { return &Lineage{ID: id, bestValue: -1e18} }
 
 // Latest 返回当前主干末端。空 lineage 返回 nil。
 func (l *Lineage) Latest() *Candidate {
@@ -70,6 +70,12 @@ func (l *Lineage) LastImprovementGen() int {
 	return l.lastImprovementGen
 }
 
+func (l *Lineage) BestValue() float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.bestValue
+}
+
 func (l *Lineage) Stopped() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -82,22 +88,47 @@ func (l *Lineage) MarkStopped() {
 	l.stopped = true
 }
 
-// Append 推进一步,同时尝试把 c 加入 BestEver。
+// Append 接受一个新评估完的候选。
 //
-// 副作用:如果 BestEver 因 c 而扩张,记录 lastImprovementGen 并触发 OnImprovement。
+// 行为:
+//   - BestEver(Pareto 历史峰值集合)无条件依据 c 重新算
+//   - 当且仅当 c 的 scalar proxy **严格优于** lineage 历史最高时,
+//     c 才被推进到 backbone(history),成为下一代的 parent
+//   - 仅 Pareto 扩张但 scalar 未赢,只更新 BestEver 与 lastImprovementGen,
+//     backbone 保持不变,避免"一次差评把 lineage 拽到更差状态"的漂移
 func (l *Lineage) Append(c *Candidate, dims []Dimension) {
 	l.mu.Lock()
-	gen := len(l.history)
-	l.history = append(l.history, c)
-	l.BestEver = updateFrontier(l.BestEver, c, dims)
 
-	improved := false
+	beforeFrontier := len(l.BestEver)
+	l.BestEver = updateFrontier(l.BestEver, c, dims)
+	frontierExpanded := false
 	for _, x := range l.BestEver {
 		if x == c {
-			l.lastImprovementGen = gen
-			improved = true
+			frontierExpanded = true
 			break
 		}
+	}
+	if len(l.BestEver) == beforeFrontier && !frontierExpanded {
+		frontierExpanded = false
+	}
+
+	scalarImproved := false
+	if c != nil && c.Score != nil && c.Score.Passed() {
+		v := c.Score.Value(dims)
+		if v > l.bestValue {
+			l.bestValue = v
+			scalarImproved = true
+		}
+	}
+
+	// 只有 scalar 严格改进才让 backbone 前进。
+	if scalarImproved {
+		l.history = append(l.history, c)
+	}
+
+	improved := scalarImproved || frontierExpanded
+	if improved && c != nil {
+		l.lastImprovementGen = c.Generation
 	}
 	cb := l.OnImprovement
 	l.mu.Unlock()
@@ -112,8 +143,6 @@ func (l *Lineage) Append(c *Candidate, dims []Dimension) {
 // ============================================================
 
 // updateFrontier 把 c 加入 frontier(Pareto 前沿),同时剔除被 c 支配的旧成员。
-//
-// 没通过硬门槛的 c 不加入,直接返回原 frontier。
 func updateFrontier(frontier []*Candidate, c *Candidate, dims []Dimension) []*Candidate {
 	if c == nil || c.Score == nil || !c.Score.Passed() {
 		return frontier
@@ -139,14 +168,8 @@ func updateFrontier(frontier []*Candidate, c *Candidate, dims []Dimension) []*Ca
 
 // PickBestInBatch 在同一父代生出的 K 个兄弟里挑一个推进 lineage 主干。
 //
-// 策略:
-//   1. 优先从通过硬门槛的子集里挑;若全没通过,fallback 取硬错误最少的
-//   2. 通过者中:取 Pareto 非支配子集
-//   3. 子集单点直接返回
-//   4. 子集多点:按 Goal.Dimension.Weight 加权打分,选最高
-//
-// 第 4 步是搜索过程中**唯一**一处把多维折成标量的地方,但只在 batch 内 tiebreak 时用,
-// 不影响全局 Pareto 前沿。即便这里挑错了,GlobalFrontier 仍兜底。
+// 与 SimpleTES 对齐:局部选择必须有一个可比较的分数。dopforge 的最终结果仍用
+// Pareto 保存多目标多样性,但 K 内提交使用 Score.Value(dims) 这个 scalar proxy。
 func PickBestInBatch(batch []*Candidate, dims []Dimension) *Candidate {
 	if len(batch) == 0 {
 		return nil
@@ -158,25 +181,17 @@ func PickBestInBatch(batch []*Candidate, dims []Dimension) *Candidate {
 		}
 	}
 	if len(passed) == 0 {
-		// 全没通过:挑硬错误最少的(便于下一轮尽快爬出深坑)
+		// 全没通过:挑硬错误最少的,便于下一轮尽快爬出深坑。
 		sort.SliceStable(batch, func(i, j int) bool {
 			return countHardFail(batch[i]) < countHardFail(batch[j])
 		})
 		return batch[0]
 	}
 
-	frontier := []*Candidate{}
-	for _, c := range passed {
-		frontier = updateFrontier(frontier, c, dims)
-	}
-	if len(frontier) == 1 {
-		return frontier[0]
-	}
-
-	sort.SliceStable(frontier, func(i, j int) bool {
-		return weightedScore(frontier[i], dims) > weightedScore(frontier[j], dims)
+	sort.SliceStable(passed, func(i, j int) bool {
+		return passed[i].Score.Value(dims) > passed[j].Score.Value(dims)
 	})
-	return frontier[0]
+	return passed[0]
 }
 
 func countHardFail(c *Candidate) int {
@@ -190,25 +205,6 @@ func countHardFail(c *Candidate) int {
 		}
 	}
 	return n
-}
-
-func weightedScore(c *Candidate, dims []Dimension) float64 {
-	if c == nil || c.Score == nil {
-		return -1e18
-	}
-	total := 0.0
-	for _, d := range dims {
-		v := c.Score.Soft[d.Name]
-		w := d.Weight
-		if w == 0 {
-			w = 1
-		}
-		if !d.HigherIsBetter {
-			v = -v
-		}
-		total += w * v
-	}
-	return total
 }
 
 // GlobalFrontier 在所有 lineage 跑完后,合并各自的 BestEver 算总前沿。
@@ -225,16 +221,14 @@ func GlobalFrontier(lins []*Lineage, dims []Dimension) []*Candidate {
 }
 
 // ============================================================
-// Plateau:停滞检测,呼应"基线最优时放弃改进"
+// Plateau:停滞检测
 // ============================================================
 
 type PlateauPolicy interface {
 	ShouldStop(l *Lineage, currentGen int) bool
 }
 
-// StallAfter 是最常用策略:连续 N 代没有 BestEver 扩张就停。
-//
-// 推荐:L<=4 设 N=2;L<=8 设 N=3;L>=10 设 N=4。
+// StallAfter 是最常用策略:连续 N 代没有 scalar proxy 或 Pareto 前沿改进就停。
 type StallAfter struct{ N int }
 
 func (p StallAfter) ShouldStop(l *Lineage, currentGen int) bool {
@@ -247,9 +241,6 @@ func (p StallAfter) ShouldStop(l *Lineage, currentGen int) bool {
 // ============================================================
 // Trajectory:最小化轨迹记录
 // ============================================================
-//
-// 完整的 IRFT 风格轨迹后处理 dopforge 不做(因为我们不训练模型);
-// 这里只记录足够回顾搜索进程的元数据,用于事后 debug + 未来可能的 forge_train 项目。
 
 type Trajectory struct {
 	StartedAt time.Time   `json:"started_at"`
@@ -257,22 +248,25 @@ type Trajectory struct {
 	BudgetC   int         `json:"budget_c"`
 	BudgetL   int         `json:"budget_l"`
 	BudgetK   int         `json:"budget_k"`
-	Picks     []TrajPick  `json:"picks"`     // 每个 lineage 每代选了谁
-	Frontier  []TrajPoint `json:"frontier"`  // 最终全局前沿
+	Picks     []TrajPick  `json:"picks"`
+	Frontier  []TrajPoint `json:"frontier"`
 }
 
 type TrajPick struct {
-	Lineage    int                `json:"lineage"`
-	Generation int                `json:"generation"`
-	PickedID   string             `json:"picked_id"`
-	PickedSoft map[string]float64 `json:"picked_soft"`
-	Notes      string             `json:"notes,omitempty"`
+	Lineage     int                `json:"lineage"`
+	Generation  int                `json:"generation"`
+	PickedID    string             `json:"picked_id"`
+	PickedValue float64            `json:"picked_value"`
+	PickedSoft  map[string]float64 `json:"picked_soft"`
+	BestSoFar   float64            `json:"best_so_far"`
+	Notes       string             `json:"notes,omitempty"`
 }
 
 type TrajPoint struct {
 	ID      string             `json:"id"`
 	WorkDir string             `json:"work_dir"`
 	Lineage int                `json:"lineage"`
+	Value   float64            `json:"value"`
 	Soft    map[string]float64 `json:"soft"`
 }
 
@@ -292,10 +286,7 @@ func (t *Trajectory) Save(root string) error {
 // 主循环:C × L × K
 // ============================================================
 
-// Mutator 把"父代 → 子代"这一步落地的回调。
-//
-// 实现方典型路径:harness.New → Index → AsLLMTools → Run。
-// child.WorkDir 已就绪(parent 的 cp -a 副本)。
+// Mutator 把“父代 → 子代”这一步落地的回调。
 type Mutator func(ctx context.Context, child, parent *Candidate) error
 
 // SearchConfig 是一次搜索的全部输入。
@@ -306,23 +297,20 @@ type SearchConfig struct {
 	Mutator  Mutator
 	Pipeline *Pipeline
 
-	C int // 并行 lineage 数,典型 4
-	L int // 每条 lineage 代数,典型 6
-	K int // 每代孩子数,典型 3
+	C int // 并行 lineage 数
+	L int // 每条 lineage 代数
+	K int // 每代孩子数
 
-	// EvalParallelism: 同代内 K 个孩子的并发上限。默认 K(全并行)。
-	// 设 1 可串行,便于调试。
+	// EvalParallelism: 同代内 K 个孩子的并发上限。默认 K。
 	EvalParallelism int
 
 	// CleanupLosers: 每代结束后是否删除被淘汰孩子的 WorkDir。默认 true。
 	CleanupLosers bool
 
 	// Plateau 决定 lineage 是否提前停止。空 = 从不提前停。
-	// 推荐 StallAfter{N: 3}。
 	Plateau PlateauPolicy
 
-	// OnImprovement:任一 lineage 检测到 BestEver 扩张时调用。
-	// Forge 用它挂 skill 蒸馏。
+	// OnImprovement:任一 lineage 检测到 BestEver 扩张或 scalar proxy 改进时调用。
 	OnImprovement func(c *Candidate)
 
 	Logger func(event string, fields map[string]any)
@@ -339,6 +327,9 @@ func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
 	if cfg.C <= 0 || cfg.L <= 0 || cfg.K <= 0 {
 		return nil, fmt.Errorf("search: C/L/K must all be > 0 (got %d/%d/%d)", cfg.C, cfg.L, cfg.K)
 	}
+	if cfg.Goal == nil {
+		return nil, fmt.Errorf("search: Goal is required")
+	}
 	if cfg.Mutator == nil || cfg.Pipeline == nil || cfg.Workspace == nil {
 		return nil, fmt.Errorf("search: Mutator/Pipeline/Workspace are all required")
 	}
@@ -352,7 +343,6 @@ func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
 
 	dims := cfg.Goal.Dimensions
 
-	// 初始化 lineages
 	lineages := make([]*Lineage, cfg.C)
 	for i := range lineages {
 		lineages[i] = NewLineage(i)
@@ -363,7 +353,9 @@ func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
 
 	traj := &Trajectory{
 		StartedAt: time.Now(),
-		BudgetC:   cfg.C, BudgetL: cfg.L, BudgetK: cfg.K,
+		BudgetC:   cfg.C,
+		BudgetL:   cfg.L,
+		BudgetK:   cfg.K,
 	}
 	var trajMu sync.Mutex
 	addPick := func(p TrajPick) {
@@ -372,22 +364,34 @@ func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
 		trajMu.Unlock()
 	}
 
-	// gen=0:种子代
+	// gen=0:种子代。只评估一次,然后复制 Score 给各 lineage 的 seed,
+	// 避免 C 条 lineage 重复消耗相同的 LLM judge 调用。
 	logf("seed_phase_start", map[string]any{"c": cfg.C})
+	var seedScore *Score
 	for _, l := range lineages {
 		seed := NewCandidate(l.ID, 0, nil)
 		if err := cfg.Workspace.Materialize(seed); err != nil {
 			return nil, fmt.Errorf("search: materialize seed L%d: %w", l.ID, err)
 		}
-		score, err := cfg.Pipeline.Evaluate(ctx, seed)
-		if err != nil {
-			return nil, fmt.Errorf("search: evaluate seed L%d: %w", l.ID, err)
+		if seedScore == nil {
+			score, err := cfg.Pipeline.Evaluate(ctx, seed)
+			if err != nil {
+				return nil, fmt.Errorf("search: evaluate seed L%d: %w", l.ID, err)
+			}
+			seedScore = score
+			seed.Score = score
+		} else {
+			seed.Score = cloneScore(seedScore)
 		}
-		seed.Score = score
 		l.Append(seed, dims)
 		addPick(TrajPick{
-			Lineage: l.ID, Generation: 0, PickedID: seed.ID,
-			PickedSoft: seed.Score.Soft, Notes: seed.Score.Notes,
+			Lineage:     l.ID,
+			Generation:  0,
+			PickedID:    seed.ID,
+			PickedValue: seed.Score.Value(dims),
+			PickedSoft:  seed.Score.Soft,
+			BestSoFar:   l.BestValue(),
+			Notes:       seed.Score.Notes,
 		})
 	}
 
@@ -423,7 +427,6 @@ func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
 		}
 		wg.Wait()
 
-		// 代后:Plateau 检测
 		if cfg.Plateau != nil {
 			for _, l := range lineages {
 				if l.Stopped() {
@@ -435,6 +438,7 @@ func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
 						"lineage":          l.ID,
 						"gen":              gen,
 						"last_improvement": l.LastImprovementGen(),
+						"best_value":       l.BestValue(),
 					})
 				}
 			}
@@ -442,11 +446,14 @@ func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
 		logf("generation_done", map[string]any{"gen": gen})
 	}
 
-	// 收尾
 	frontier := GlobalFrontier(lineages, dims)
 	for _, c := range frontier {
 		traj.Frontier = append(traj.Frontier, TrajPoint{
-			ID: c.ID, WorkDir: c.WorkDir, Lineage: c.Lineage, Soft: c.Score.Soft,
+			ID:      c.ID,
+			WorkDir: c.WorkDir,
+			Lineage: c.Lineage,
+			Value:   c.Score.Value(dims),
+			Soft:    c.Score.Soft,
 		})
 	}
 	traj.EndedAt = time.Now()
@@ -456,6 +463,22 @@ func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
 		"duration":      traj.EndedAt.Sub(traj.StartedAt).String(),
 	})
 	return &SearchResult{Frontier: frontier, Lineages: lineages, Trajectory: traj}, nil
+}
+
+func cloneScore(s *Score) *Score {
+	if s == nil {
+		return nil
+	}
+	out := &Score{
+		Hard:  make([]GateResult, len(s.Hard)),
+		Soft:  make(map[string]float64, len(s.Soft)),
+		Notes: s.Notes,
+	}
+	copy(out.Hard, s.Hard)
+	for k, v := range s.Soft {
+		out.Soft[k] = v
+	}
+	return out
 }
 
 // runOneStep:某条 lineage 的一次 L 步骤。
@@ -489,7 +512,7 @@ func runOneStep(
 				logf("mutate_err", map[string]any{
 					"lineage": l.ID, "gen": gen, "id": child.ID, "err": err.Error(),
 				})
-				// 即便 mutate 报错也仍然评估——可能从 Pipeline 拿到有用的 Notes
+				// 即便 mutate 报错也仍然评估,可能从 Pipeline 拿到有用 Notes。
 			}
 			score, err := cfg.Pipeline.Evaluate(ctx, child)
 			if err != nil {
@@ -530,10 +553,19 @@ func runOneStep(
 	}
 
 	logf("step_done", map[string]any{
-		"lineage": l.ID, "gen": gen, "picked": winner.ID, "children": len(live),
+		"lineage":  l.ID,
+		"gen":      gen,
+		"picked":   winner.ID,
+		"value":    winner.Score.Value(dims),
+		"children": len(live),
 	})
 	return &TrajPick{
-		Lineage: l.ID, Generation: gen, PickedID: winner.ID,
-		PickedSoft: winner.Score.Soft, Notes: winner.Score.Notes,
+		Lineage:     l.ID,
+		Generation:  gen,
+		PickedID:    winner.ID,
+		PickedValue: winner.Score.Value(dims),
+		PickedSoft:  winner.Score.Soft,
+		BestSoFar:   l.BestValue(),
+		Notes:       winner.Score.Notes,
 	}
 }

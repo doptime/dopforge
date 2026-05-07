@@ -1,0 +1,2409 @@
+===== ./forge.go =====
+package dopforge
+
+import (
+	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/doptime/dopharness/gateway"
+	"github.com/doptime/dopharness/harness"
+	"github.com/doptime/dopharness/memory"
+	"github.com/doptime/dopharness/tools"
+)
+
+// ============================================================
+// Forge:dopforge 对外的最终门面
+// ============================================================
+//
+// 一个 Forge 实例聚合 Goal、Workspace、Pipeline、SharedMemory 和 dopharness Caller。
+// Forge.Run 把这一切串成一次 C×L×K 方法论迭代搜索。
+
+type Forge struct {
+	cfg       Config
+	workspace *Workspace
+}
+
+// Config 是 Forge 的构造参数。
+type Config struct {
+	Goal *Goal
+
+	// SeedDir:第一代候选解从这里 cp -a。空则白板起步。
+	// 对方法论任务,推荐放一个只包含 METHOD.md 的最小种子目录。
+	SeedDir string
+
+	// WorkRoot:所有候选解工作目录的根。会自动创建。
+	WorkRoot string
+
+	// dopharness 的三个 Caller。
+	TriageCaller gateway.TriageCaller
+	ExpandCaller gateway.ExpandCaller // 可空(EnableExpand=false 时)
+	MainCaller   harness.MainCaller
+
+	// EnableExpand 透传给 dopharness。默认 false。
+	EnableExpand bool
+
+	// ToolBuilder 桥接 dopharness 工具到具体 LLM SDK。
+	ToolBuilder tools.ToolBuilder
+
+	// Pipeline 是评估器(必填)。
+	Pipeline *Pipeline
+
+	// SharedMemory 接入 dopharness 的 L0/L2/L3 记忆,所有 candidate 共享迭代纪律、
+	// Goal 事实和跨 lineage 的方法论改进 SOP。强烈推荐启用。
+	SharedMemory *SharedMemory
+
+	// SkillDistiller 在某 candidate 进入 lineage BestEver 时被调用,把有效改法蒸馏成
+	// 一篇 .md skill 写入共享 SkillsDir。
+	SkillDistiller SkillDistiller
+
+	Logger func(event string, fields map[string]any)
+}
+
+// Budget 是搜索预算。
+type Budget struct {
+	C int // 并行 lineage 数,典型 4
+	L int // 每条 lineage 代数,典型 6
+	K int // 每代孩子数,典型 3
+}
+
+// New 构造一个 Forge,做必要的 sanity check。
+func New(cfg Config) (*Forge, error) {
+	if cfg.Goal == nil {
+		return nil, fmt.Errorf("forge: Goal is required")
+	}
+	if cfg.WorkRoot == "" {
+		return nil, fmt.Errorf("forge: WorkRoot is required")
+	}
+	if cfg.TriageCaller == nil {
+		return nil, fmt.Errorf("forge: TriageCaller is required")
+	}
+	if cfg.MainCaller == nil {
+		return nil, fmt.Errorf("forge: MainCaller is required")
+	}
+	if cfg.ToolBuilder == nil {
+		return nil, fmt.Errorf("forge: ToolBuilder is required")
+	}
+	if cfg.Pipeline == nil {
+		return nil, fmt.Errorf("forge: Pipeline is required")
+	}
+	if cfg.EnableExpand && cfg.ExpandCaller == nil {
+		return nil, fmt.Errorf("forge: ExpandCaller required when EnableExpand=true")
+	}
+
+	ws, err := NewWorkspace(cfg.WorkRoot, cfg.SeedDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Pipeline.Goal = cfg.Goal
+
+	return &Forge{cfg: cfg, workspace: ws}, nil
+}
+
+// Run 启动一次完整搜索。
+func (f *Forge) Run(ctx context.Context, b Budget) (*SearchResult, error) {
+	mutator := f.makeMutator()
+
+	var onImprove func(c *Candidate)
+	if f.cfg.SharedMemory != nil {
+		onImprove = func(c *Candidate) {
+			err := f.cfg.SharedMemory.MaybeRecordSkill(ctx, c, c.Parent, f.cfg.SkillDistiller)
+			if err != nil && f.cfg.Logger != nil {
+				f.cfg.Logger("skill_record_err", map[string]any{
+					"candidate": c.ID, "err": err.Error(),
+				})
+			}
+		}
+	}
+
+	scfg := SearchConfig{
+		Goal:          f.cfg.Goal,
+		Workspace:     f.workspace,
+		Mutator:       mutator,
+		Pipeline:      f.cfg.Pipeline,
+		C:             b.C,
+		L:             b.L,
+		K:             b.K,
+		Logger:        f.cfg.Logger,
+		CleanupLosers: true,
+		Plateau:       StallAfter{N: defaultStallN(b.L)},
+		OnImprovement: onImprove,
+	}
+	return RunSearch(ctx, scfg)
+}
+
+func defaultStallN(L int) int {
+	switch {
+	case L <= 4:
+		return 3
+	case L <= 8:
+		return 4
+	default:
+		return 5
+	}
+}
+
+// makeMutator 把 dopharness 包成 Mutator。这是 dopforge 与 dopharness 的唯一接触面。
+func (f *Forge) makeMutator() Mutator {
+	return func(ctx context.Context, child, parent *Candidate) error {
+		hcfg := harness.Config{
+			ProjectRoot:  child.WorkDir,
+			TriageCaller: f.cfg.TriageCaller,
+			ExpandCaller: f.cfg.ExpandCaller,
+			MainCaller:   f.cfg.MainCaller,
+			EnableExpand: f.cfg.EnableExpand,
+			MaxRetries:   3,
+		}
+		if f.cfg.Logger != nil {
+			hcfg.Logger = func(ev string, fields map[string]any) {
+				if fields == nil {
+					fields = map[string]any{}
+				}
+				fields["candidate"] = child.ID
+				f.cfg.Logger("dopharness."+ev, fields)
+			}
+		}
+
+		h, err := harness.New(hcfg)
+		if err != nil {
+			return fmt.Errorf("mutate %s: harness.New: %w", child.ID, err)
+		}
+		if f.cfg.SharedMemory != nil {
+			f.cfg.SharedMemory.ApplyTo(h)
+		}
+		if _, err := h.Index(ctx); err != nil {
+			return fmt.Errorf("mutate %s: index: %w", child.ID, err)
+		}
+		h.AsLLMTools(f.cfg.ToolBuilder)
+
+		prompt := buildMutatorPrompt(f.cfg.Goal, parent, f.cfg.SharedMemory != nil)
+		child.PromptLog = prompt
+
+		_, err = h.Run(ctx, prompt)
+		if err != nil {
+			return fmt.Errorf("mutate %s: run: %w", child.ID, err)
+		}
+		return nil
+	}
+}
+
+func buildMutatorPrompt(g *Goal, parent *Candidate, memoryActive bool) string {
+	_ = memoryActive // 保留参数以维持兼容签名;goal 一律写入 prompt
+	var sb strings.Builder
+	sb.WriteString("<goal>\n")
+	sb.WriteString(g.Description)
+	sb.WriteString("\n</goal>\n\n")
+	if parent != nil && parent.Score != nil && parent.Score.Notes != "" {
+		sb.WriteString("<previous_evaluation>\n")
+		sb.WriteString("Your previous methodology document was scored. Below is the judge's feedback. ")
+		sb.WriteString("Make a substantive improvement, not a cosmetic change.\n\n")
+		sb.WriteString(parent.Score.Notes)
+		sb.WriteString("\n</previous_evaluation>\n\n")
+	}
+	sb.WriteString("<anti_patterns>\n")
+	sb.WriteString("- Renaming, reordering, or reformatting sections without changing what they teach\n")
+	sb.WriteString("- Sprinkling terminology (元认知, 迁移, 刻意练习, 抗遗忘, 反馈闭环) without procedures, examples, or templates that operationalize them\n")
+	sb.WriteString("- Replacing concrete examples or templates with abstract principles\n")
+	sb.WriteString("- Padding with bullet lists where prose, tables, or worked examples would teach more\n")
+	sb.WriteString("</anti_patterns>\n\n")
+	sb.WriteString("<instruction>\n")
+	sb.WriteString("Improve the methodology Markdown document to better satisfy the goal. ")
+	sb.WriteString("The desired output is documentation only, preferably a single METHOD.md unless the goal says otherwise. ")
+	sb.WriteString("Do not create source code, Go modules, shell scripts, package manifests, Dockerfiles, test runners, sandboxes, or runnable applications. ")
+	sb.WriteString("Use the provided tools only to edit Markdown content and supporting Markdown notes. ")
+	sb.WriteString("If you create a file, create only .md/.markdown files. ")
+	sb.WriteString("Make a meaningful improvement to structure, concepts, examples, checklists, tradeoffs, anti-patterns, or review loops. ")
+	sb.WriteString("Prefer precise sections, operational procedures, and reusable methodology over generic inspirational prose. ")
+	sb.WriteString("\n</instruction>")
+	return sb.String()
+}
+
+// ============================================================
+// SharedMemory:接入 dopharness 4 层记忆,真正解锁跨 lineage 学习
+// ============================================================
+
+const dopforgeMetaRules = `# dopforge methodology iteration rules
+
+You are operating inside a methodology-document search loop. Your output will be
+evaluated, scored, and either advanced as the next generation or discarded.
+
+1. **Documentation only.** The target artifact is methodology Markdown. Do not
+   create runnable software projects, Go modules, shell scripts, sandboxes,
+   package manifests, Dockerfiles, test runners, or app scaffolding unless the
+   goal explicitly asks for them.
+
+2. **Address concrete critique first.** If <previous_evaluation> is present,
+   the judge's notes name specific gaps. Fix those before pursuing new ideas.
+
+3. **Substantive over cosmetic.** Renaming sections, reformatting, or adding
+   motivational prose rarely moves the score. Improve conceptual structure,
+   decision procedures, examples, exercises, feedback loops, or failure modes.
+
+4. **Preserve useful prior structure.** Do not undo prior progress unless you
+   can articulate why the previous direction was wrong. Read task skills and L4
+   session records before reverting.
+
+5. **Use tools surgically.** Multiple markdown chunk edits are normal. Prefer
+   modifying or adding focused sections over rewriting the whole document.
+
+6. **When stuck, search.** If <project_context> is thin, use search/read tools to
+   inspect existing Markdown before editing.
+`
+
+// SharedMemoryConfig 是构造共享记忆的输入。
+type SharedMemoryConfig struct {
+	// SkillsDir 是 L3 共享技能目录的绝对路径。所有 candidate 共用此目录。
+	SkillsDir string
+	// MetaRulesOverride 替换默认 dopforgeMetaRules。空则用默认。
+	MetaRulesOverride string
+	// Goal 用来渲染 L2 事实段。
+	Goal *Goal
+}
+
+// SharedMemory 是被注入到每个 dopharness Harness 的 L0/L2/L3。
+type SharedMemory struct {
+	cfg SharedMemoryConfig
+
+	l0 memory.Layer
+	l2 memory.Layer
+	l3 *memory.TaskSkillsLayer
+
+	mu       sync.Mutex
+	skillSet map[string]struct{}
+}
+
+// NewSharedMemory 构造并就地准备 SkillsDir。
+func NewSharedMemory(cfg SharedMemoryConfig) (*SharedMemory, error) {
+	if cfg.SkillsDir == "" {
+		return nil, fmt.Errorf("forge: SharedMemoryConfig.SkillsDir is required")
+	}
+	if cfg.Goal == nil {
+		return nil, fmt.Errorf("forge: SharedMemoryConfig.Goal is required")
+	}
+	if err := os.MkdirAll(cfg.SkillsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("forge: mkdir SkillsDir: %w", err)
+	}
+
+	rules := cfg.MetaRulesOverride
+	if rules == "" {
+		rules = dopforgeMetaRules
+	}
+
+	return &SharedMemory{
+		cfg:      cfg,
+		l0:       &memory.MetaRulesLayer{Fallback: rules},
+		l2:       &memory.GlobalFactsLayer{Fallback: renderGoalAsFacts(cfg.Goal)},
+		l3:       &memory.TaskSkillsLayer{Dir: cfg.SkillsDir},
+		skillSet: make(map[string]struct{}),
+	}, nil
+}
+
+// ApplyTo 把共享层覆盖到一个 Harness 的 Memory 上。
+func (s *SharedMemory) ApplyTo(h *harness.Harness) {
+	mem := h.Memory()
+	if mem == nil {
+		return
+	}
+	mem.L0 = s.l0
+	mem.L2 = s.l2
+	mem.L3 = s.l3
+}
+
+// RecordSkill 把“什么改动有效”的总结写进共享 SkillsDir。
+func (s *SharedMemory) RecordSkill(key, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.skillSet[key] = struct{}{}
+	fname := sanitizeSkillFilename(key)
+	path := filepath.Join(s.cfg.SkillsDir, fname+".md")
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+// SessionRecord 把一段迭代摘要写进 candidate 自己的 L4。
+func (s *SharedMemory) SessionRecord(c *Candidate, summary string) error {
+	if c.WorkDir == "" {
+		return fmt.Errorf("session_record: candidate %s has no WorkDir", c.ID)
+	}
+	dir := filepath.Join(c.WorkDir, ".dopharness", "memory", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	stamp := time.Now().UTC().Format("20060102T150405")
+	fname := fmt.Sprintf("%s_%s.md", stamp, c.ID)
+	return os.WriteFile(filepath.Join(dir, fname), []byte(summary), 0o644)
+}
+
+// SkillDistiller 是用户提供的“看 winner 的产出蒸馏出 skill 文本”的回调。
+type SkillDistiller func(ctx context.Context, winner, parent *Candidate) (key, content string, err error)
+
+// MaybeRecordSkill 在 winner 进入 BestEver 时蒸馏成 skill。
+func (s *SharedMemory) MaybeRecordSkill(
+	ctx context.Context, winner, parent *Candidate, distiller SkillDistiller,
+) error {
+	if winner.Score != nil && winner.Score.Notes != "" {
+		summary := fmt.Sprintf("# %s (gen %d)\n\n## Judge feedback\n\n%s\n",
+			winner.ID, winner.Generation, winner.Score.Notes)
+		if err := s.SessionRecord(winner, summary); err != nil {
+			return err
+		}
+	}
+	if distiller == nil {
+		return nil
+	}
+	key, content, err := distiller(ctx, winner, parent)
+	if err != nil {
+		return fmt.Errorf("distill skill for %s: %w", winner.ID, err)
+	}
+	if key == "" || content == "" {
+		return nil
+	}
+	return s.RecordSkill(key, content)
+}
+
+// renderGoalAsFacts 把 Goal 序列化成 L2 风格的事实文本。
+func renderGoalAsFacts(g *Goal) string {
+	var sb strings.Builder
+	sb.WriteString("# Methodology Goal\n\n")
+	sb.WriteString(g.Description)
+	sb.WriteString("\n\n# Evaluation Dimensions\n\n")
+	for _, d := range g.Dimensions {
+		dir := "higher is better"
+		if !d.HigherIsBetter {
+			dir = "lower is better"
+		}
+		sb.WriteString(fmt.Sprintf("- **%s** (%s)\n", d.Name, dir))
+	}
+	if len(g.HardGates) > 0 {
+		sb.WriteString("\n# Hard Gates (must pass)\n\n")
+		for _, h := range g.HardGates {
+			sb.WriteString("- " + h.Name() + "\n")
+		}
+	}
+	if g.LLMJudgeRubric != "" {
+		sb.WriteString("\n# Judge Rubric\n\n")
+		sb.WriteString(g.LLMJudgeRubric)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+func sanitizeSkillFilename(key string) string {
+	var clean strings.Builder
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			clean.WriteRune(r)
+		case r == '_' || r == '-' || r == ' ':
+			clean.WriteRune('_')
+		}
+	}
+	prefix := clean.String()
+	if len(prefix) > 40 {
+		prefix = prefix[:40]
+	}
+	h := sha1.Sum([]byte(key))
+	return prefix + "_" + hex.EncodeToString(h[:4])
+}
+
+===== ./search.go =====
+package dopforge
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+)
+
+// ============================================================
+// Lineage:C 路并行的某一路
+// ============================================================
+//
+// 每个 L 步骤里:在 Latest() 上拷出 K 份 → 各自 mutate → 评价 → 从 K 个孩子里
+// 用 SimpleTES 风格 scalar proxy 挑赢家,Append 推进 lineage。
+//
+// BestEver 仍保存 Pareto 历史峰值集合,用于最终给人类保留多种互不支配的方法论版本。
+// bestValue 则保存该 lineage 的历史最高 scalar proxy,用于停滞判断和日志。
+
+type Lineage struct {
+	ID int
+
+	mu      sync.Mutex
+	history []*Candidate // history[0] 是种子,后续每代追加一个“当代赢家”
+
+	// BestEver 是这条 lineage 的 Pareto 历史峰值集合(可能多个非支配点)。
+	BestEver []*Candidate
+
+	// bestValue 是该 lineage 历史最高 scalar proxy。
+	bestValue float64
+
+	// lastImprovementGen 记录最近一次 scalar proxy 或 Pareto 前沿扩张的代数。
+	lastImprovementGen int
+
+	// stopped 由 search.RunSearch 在 Plateau 命中时设置,后续代不再生成孩子。
+	stopped bool
+
+	// OnImprovement 在 Append 检测到 BestEver 扩张或 scalar proxy 改进时被调用(在锁外)。
+	OnImprovement func(c *Candidate)
+}
+
+func NewLineage(id int) *Lineage { return &Lineage{ID: id, bestValue: -1e18} }
+
+// Latest 返回当前主干末端。空 lineage 返回 nil。
+func (l *Lineage) Latest() *Candidate {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.history) == 0 {
+		return nil
+	}
+	return l.history[len(l.history)-1]
+}
+
+// History 返回主干的只读快照。
+func (l *Lineage) History() []*Candidate {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]*Candidate, len(l.history))
+	copy(out, l.history)
+	return out
+}
+
+func (l *Lineage) LastImprovementGen() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastImprovementGen
+}
+
+func (l *Lineage) BestValue() float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.bestValue
+}
+
+func (l *Lineage) Stopped() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.stopped
+}
+
+func (l *Lineage) MarkStopped() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stopped = true
+}
+
+// Append 接受一个新评估完的候选。
+//
+// 行为:
+//   - BestEver(Pareto 历史峰值集合)无条件依据 c 重新算
+//   - 当且仅当 c 的 scalar proxy **严格优于** lineage 历史最高时,
+//     c 才被推进到 backbone(history),成为下一代的 parent
+//   - 仅 Pareto 扩张但 scalar 未赢,只更新 BestEver 与 lastImprovementGen,
+//     backbone 保持不变,避免"一次差评把 lineage 拽到更差状态"的漂移
+func (l *Lineage) Append(c *Candidate, dims []Dimension) {
+	l.mu.Lock()
+
+	beforeFrontier := len(l.BestEver)
+	l.BestEver = updateFrontier(l.BestEver, c, dims)
+	frontierExpanded := false
+	for _, x := range l.BestEver {
+		if x == c {
+			frontierExpanded = true
+			break
+		}
+	}
+	if len(l.BestEver) == beforeFrontier && !frontierExpanded {
+		frontierExpanded = false
+	}
+
+	scalarImproved := false
+	if c != nil && c.Score != nil && c.Score.Passed() {
+		v := c.Score.Value(dims)
+		if v > l.bestValue {
+			l.bestValue = v
+			scalarImproved = true
+		}
+	}
+
+	// 只有 scalar 严格改进才让 backbone 前进。
+	if scalarImproved {
+		l.history = append(l.history, c)
+	}
+
+	improved := scalarImproved || frontierExpanded
+	if improved && c != nil {
+		l.lastImprovementGen = c.Generation
+	}
+	cb := l.OnImprovement
+	l.mu.Unlock()
+
+	if improved && cb != nil {
+		cb(c)
+	}
+}
+
+// ============================================================
+// Pareto 前沿与 batch 内决策
+// ============================================================
+
+// updateFrontier 把 c 加入 frontier(Pareto 前沿),同时剔除被 c 支配的旧成员。
+func updateFrontier(frontier []*Candidate, c *Candidate, dims []Dimension) []*Candidate {
+	if c == nil || c.Score == nil || !c.Score.Passed() {
+		return frontier
+	}
+	kept := make([]*Candidate, 0, len(frontier)+1)
+	dominated := false
+	for _, x := range frontier {
+		switch {
+		case x.Score.Dominates(c.Score, dims):
+			kept = append(kept, x)
+			dominated = true
+		case c.Score.Dominates(x.Score, dims):
+			// x 被 c 干掉,跳过
+		default:
+			kept = append(kept, x)
+		}
+	}
+	if !dominated {
+		kept = append(kept, c)
+	}
+	return kept
+}
+
+// PickBestInBatch 在同一父代生出的 K 个兄弟里挑一个推进 lineage 主干。
+//
+// 与 SimpleTES 对齐:局部选择必须有一个可比较的分数。dopforge 的最终结果仍用
+// Pareto 保存多目标多样性,但 K 内提交使用 Score.Value(dims) 这个 scalar proxy。
+func PickBestInBatch(batch []*Candidate, dims []Dimension) *Candidate {
+	if len(batch) == 0 {
+		return nil
+	}
+	var passed []*Candidate
+	for _, c := range batch {
+		if c.Score != nil && c.Score.Passed() {
+			passed = append(passed, c)
+		}
+	}
+	if len(passed) == 0 {
+		// 全没通过:挑硬错误最少的,便于下一轮尽快爬出深坑。
+		sort.SliceStable(batch, func(i, j int) bool {
+			return countHardFail(batch[i]) < countHardFail(batch[j])
+		})
+		return batch[0]
+	}
+
+	sort.SliceStable(passed, func(i, j int) bool {
+		return passed[i].Score.Value(dims) > passed[j].Score.Value(dims)
+	})
+	return passed[0]
+}
+
+func countHardFail(c *Candidate) int {
+	if c == nil || c.Score == nil {
+		return 1 << 30
+	}
+	n := 0
+	for _, h := range c.Score.Hard {
+		if h.Err != nil {
+			n++
+		}
+	}
+	return n
+}
+
+func weightedScore(c *Candidate, dims []Dimension) float64 {
+	if c == nil || c.Score == nil {
+		return -1e18
+	}
+	return c.Score.Value(dims)
+}
+
+// GlobalFrontier 在所有 lineage 跑完后,合并各自的 BestEver 算总前沿。
+func GlobalFrontier(lins []*Lineage, dims []Dimension) []*Candidate {
+	var out []*Candidate
+	for _, l := range lins {
+		l.mu.Lock()
+		for _, c := range l.BestEver {
+			out = updateFrontier(out, c, dims)
+		}
+		l.mu.Unlock()
+	}
+	return out
+}
+
+// ============================================================
+// Plateau:停滞检测
+// ============================================================
+
+type PlateauPolicy interface {
+	ShouldStop(l *Lineage, currentGen int) bool
+}
+
+// StallAfter 是最常用策略:连续 N 代没有 scalar proxy 或 Pareto 前沿改进就停。
+type StallAfter struct{ N int }
+
+func (p StallAfter) ShouldStop(l *Lineage, currentGen int) bool {
+	if p.N <= 0 {
+		return false
+	}
+	return currentGen-l.LastImprovementGen() >= p.N
+}
+
+// ============================================================
+// Trajectory:最小化轨迹记录
+// ============================================================
+
+type Trajectory struct {
+	StartedAt time.Time   `json:"started_at"`
+	EndedAt   time.Time   `json:"ended_at"`
+	BudgetC   int         `json:"budget_c"`
+	BudgetL   int         `json:"budget_l"`
+	BudgetK   int         `json:"budget_k"`
+	Picks     []TrajPick  `json:"picks"`
+	Frontier  []TrajPoint `json:"frontier"`
+}
+
+type TrajPick struct {
+	Lineage     int                `json:"lineage"`
+	Generation  int                `json:"generation"`
+	PickedID    string             `json:"picked_id"`
+	PickedValue float64            `json:"picked_value"`
+	PickedSoft  map[string]float64 `json:"picked_soft"`
+	BestSoFar   float64            `json:"best_so_far"`
+	Notes       string             `json:"notes,omitempty"`
+}
+
+type TrajPoint struct {
+	ID      string             `json:"id"`
+	WorkDir string             `json:"work_dir"`
+	Lineage int                `json:"lineage"`
+	Value   float64            `json:"value"`
+	Soft    map[string]float64 `json:"soft"`
+}
+
+// Save 把 Trajectory 序列化到 <root>/trajectory.json。
+func (t *Trajectory) Save(root string) error {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, "trajectory.json"), data, 0o644)
+}
+
+// ============================================================
+// 主循环:C × L × K
+// ============================================================
+
+// Mutator 把“父代 → 子代”这一步落地的回调。
+type Mutator func(ctx context.Context, child, parent *Candidate) error
+
+// SearchConfig 是一次搜索的全部输入。
+type SearchConfig struct {
+	Goal      *Goal
+	Workspace *Workspace
+
+	Mutator  Mutator
+	Pipeline *Pipeline
+
+	C int // 并行 lineage 数
+	L int // 每条 lineage 代数
+	K int // 每代孩子数
+
+	// EvalParallelism: 同代内 K 个孩子的并发上限。默认 K。
+	EvalParallelism int
+
+	// CleanupLosers: 每代结束后是否删除被淘汰孩子的 WorkDir。默认 true。
+	CleanupLosers bool
+
+	// Plateau 决定 lineage 是否提前停止。空 = 从不提前停。
+	Plateau PlateauPolicy
+
+	// OnImprovement:任一 lineage 检测到 BestEver 扩张或 scalar proxy 改进时调用。
+	OnImprovement func(c *Candidate)
+
+	Logger func(event string, fields map[string]any)
+}
+
+type SearchResult struct {
+	Frontier   []*Candidate
+	Lineages   []*Lineage
+	Trajectory *Trajectory
+}
+
+// RunSearch 启动 C×L×K 搜索。
+func RunSearch(ctx context.Context, cfg SearchConfig) (*SearchResult, error) {
+	if cfg.C <= 0 || cfg.L <= 0 || cfg.K <= 0 {
+		return nil, fmt.Errorf("search: C/L/K must all be > 0 (got %d/%d/%d)", cfg.C, cfg.L, cfg.K)
+	}
+	if cfg.Goal == nil {
+		return nil, fmt.Errorf("search: Goal is required")
+	}
+	if cfg.Mutator == nil || cfg.Pipeline == nil || cfg.Workspace == nil {
+		return nil, fmt.Errorf("search: Mutator/Pipeline/Workspace are all required")
+	}
+	if cfg.EvalParallelism <= 0 {
+		cfg.EvalParallelism = cfg.K
+	}
+	logf := cfg.Logger
+	if logf == nil {
+		logf = func(string, map[string]any) {}
+	}
+
+	dims := cfg.Goal.Dimensions
+
+	lineages := make([]*Lineage, cfg.C)
+	for i := range lineages {
+		lineages[i] = NewLineage(i)
+		if cfg.OnImprovement != nil {
+			lineages[i].OnImprovement = cfg.OnImprovement
+		}
+	}
+
+	traj := &Trajectory{
+		StartedAt: time.Now(),
+		BudgetC:   cfg.C,
+		BudgetL:   cfg.L,
+		BudgetK:   cfg.K,
+	}
+	var trajMu sync.Mutex
+	addPick := func(p TrajPick) {
+		trajMu.Lock()
+		traj.Picks = append(traj.Picks, p)
+		trajMu.Unlock()
+	}
+
+	// gen=0:种子代。只评估一次,然后复制 Score 给各 lineage 的 seed,
+	// 避免 C 条 lineage 重复消耗相同的 LLM judge 调用。
+	logf("seed_phase_start", map[string]any{"c": cfg.C})
+	var seedScore *Score
+	for _, l := range lineages {
+		seed := NewCandidate(l.ID, 0, nil)
+		if err := cfg.Workspace.Materialize(seed); err != nil {
+			return nil, fmt.Errorf("search: materialize seed L%d: %w", l.ID, err)
+		}
+		if seedScore == nil {
+			score, err := cfg.Pipeline.Evaluate(ctx, seed)
+			if err != nil {
+				return nil, fmt.Errorf("search: evaluate seed L%d: %w", l.ID, err)
+			}
+			seedScore = score
+			seed.Score = score
+		} else {
+			seed.Score = cloneScore(seedScore)
+		}
+		l.Append(seed, dims)
+		addPick(TrajPick{
+			Lineage:     l.ID,
+			Generation:  0,
+			PickedID:    seed.ID,
+			PickedValue: seed.Score.Value(dims),
+			PickedSoft:  seed.Score.Soft,
+			BestSoFar:   l.BestValue(),
+			Notes:       seed.Score.Notes,
+		})
+	}
+
+	// gen=1..L:主循环
+	for gen := 1; gen <= cfg.L; gen++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		alive := 0
+		for _, l := range lineages {
+			if !l.Stopped() {
+				alive++
+			}
+		}
+		if alive == 0 {
+			logf("all_lineages_stalled", map[string]any{"gen": gen})
+			break
+		}
+		logf("generation_start", map[string]any{"gen": gen, "alive": alive})
+
+		var wg sync.WaitGroup
+		for _, l := range lineages {
+			if l.Stopped() {
+				continue
+			}
+			wg.Add(1)
+			go func(l *Lineage) {
+				defer wg.Done()
+				if pick := runOneStep(ctx, cfg, l, gen, dims, logf); pick != nil {
+					addPick(*pick)
+				}
+			}(l)
+		}
+		wg.Wait()
+
+		if cfg.Plateau != nil {
+			for _, l := range lineages {
+				if l.Stopped() {
+					continue
+				}
+				if cfg.Plateau.ShouldStop(l, gen) {
+					l.MarkStopped()
+					logf("lineage_stalled", map[string]any{
+						"lineage":          l.ID,
+						"gen":              gen,
+						"last_improvement": l.LastImprovementGen(),
+						"best_value":       l.BestValue(),
+					})
+				}
+			}
+		}
+		logf("generation_done", map[string]any{"gen": gen})
+	}
+
+	frontier := GlobalFrontier(lineages, dims)
+	for _, c := range frontier {
+		traj.Frontier = append(traj.Frontier, TrajPoint{
+			ID:      c.ID,
+			WorkDir: c.WorkDir,
+			Lineage: c.Lineage,
+			Value:   c.Score.Value(dims),
+			Soft:    c.Score.Soft,
+		})
+	}
+	traj.EndedAt = time.Now()
+
+	logf("search_done", map[string]any{
+		"frontier_size": len(frontier),
+		"duration":      traj.EndedAt.Sub(traj.StartedAt).String(),
+	})
+	return &SearchResult{Frontier: frontier, Lineages: lineages, Trajectory: traj}, nil
+}
+
+func cloneScore(s *Score) *Score {
+	if s == nil {
+		return nil
+	}
+	out := &Score{
+		Hard:  make([]GateResult, len(s.Hard)),
+		Soft:  make(map[string]float64, len(s.Soft)),
+		Notes: s.Notes,
+	}
+	copy(out.Hard, s.Hard)
+	for k, v := range s.Soft {
+		out.Soft[k] = v
+	}
+	return out
+}
+
+// runOneStep:某条 lineage 的一次 L 步骤。
+func runOneStep(
+	ctx context.Context, cfg SearchConfig, l *Lineage, gen int,
+	dims []Dimension, logf func(string, map[string]any),
+) *TrajPick {
+	parent := l.Latest()
+	if parent == nil {
+		return nil
+	}
+
+	children := make([]*Candidate, cfg.K)
+	var inner sync.WaitGroup
+	sem := make(chan struct{}, cfg.EvalParallelism)
+	for k := 0; k < cfg.K; k++ {
+		inner.Add(1)
+		go func(k int) {
+			defer inner.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			child := NewCandidate(l.ID, gen, parent)
+			if err := cfg.Workspace.Materialize(child); err != nil {
+				logf("materialize_err", map[string]any{
+					"lineage": l.ID, "gen": gen, "k": k, "err": err.Error(),
+				})
+				return
+			}
+			if err := cfg.Mutator(ctx, child, parent); err != nil {
+				logf("mutate_err", map[string]any{
+					"lineage": l.ID, "gen": gen, "id": child.ID, "err": err.Error(),
+				})
+				// 即便 mutate 报错也仍然评估,可能从 Pipeline 拿到有用 Notes。
+			}
+			score, err := cfg.Pipeline.Evaluate(ctx, child)
+			if err != nil {
+				logf("evaluate_err", map[string]any{
+					"lineage": l.ID, "gen": gen, "id": child.ID, "err": err.Error(),
+				})
+				return
+			}
+			child.Score = score
+			children[k] = child
+		}(k)
+	}
+	inner.Wait()
+
+	live := make([]*Candidate, 0, cfg.K)
+	for _, c := range children {
+		if c != nil {
+			live = append(live, c)
+		}
+	}
+	if len(live) == 0 {
+		logf("step_all_failed", map[string]any{"lineage": l.ID, "gen": gen})
+		return nil
+	}
+
+	winner := PickBestInBatch(live, dims)
+	if winner == nil {
+		return nil
+	}
+	l.Append(winner, dims)
+
+	if cfg.CleanupLosers {
+		for _, c := range live {
+			if c != winner {
+				_ = cfg.Workspace.Cleanup(c)
+			}
+		}
+	}
+
+	logf("step_done", map[string]any{
+		"lineage":  l.ID,
+		"gen":      gen,
+		"picked":   winner.ID,
+		"value":    winner.Score.Value(dims),
+		"children": len(live),
+	})
+	return &TrajPick{
+		Lineage:     l.ID,
+		Generation:  gen,
+		PickedID:    winner.ID,
+		PickedValue: winner.Score.Value(dims),
+		PickedSoft:  winner.Score.Soft,
+		BestSoFar:   l.BestValue(),
+		Notes:       winner.Score.Notes,
+	}
+}
+
+===== ./README.md =====
+# dopforge
+
+> 用 SimpleTES 风格的 C×L×K 评估驱动搜索,迭代 Markdown 方法论文档。
+>
+> 底层修改引擎是 `dopharness`:它提供受控的 chunk 索引、三态上下文筛选和工具化编辑。
+> 从工程心智看,dopharness 接近 GenericAgent 的 Agent/ToolCall 循环,再叠加 AST/Markdown
+> chunk 化与失败回滚;dopforge 则把它放进评估驱动的搜索外循环。
+
+## 项目定位
+
+dopforge 不是某个具体“认字游戏”或“如何学习”的项目。它是一个**方法论迭代工具**:
+
+1. 用户给出一个方法论探索目标,例如“如何学习”“如何做产品调研”“如何做论文复现”。
+2. dopforge 维护多条并行 lineage,每条 lineage 迭代修改 Markdown 方法论文档。
+3. 每一代生成 K 个候选版本,通过硬门槛 + LLM 多维 judge 评价。
+4. 搜索内部用一个 weighted scalar proxy 做 SimpleTES 风格局部选择。
+5. 最终仍输出 Pareto Frontier,保留多目标互不支配的方法论版本供人类挑选。
+
+这个分层很重要:
+
+- **框架意图**:方法论迭代引擎,写在代码、README 和默认 prompt 中。
+- **用户任务意图**:某次具体探索的目标、维度、硬门槛和运行目录,写在 `examples/<task>/goal.json` 中。
+
+## 与 SimpleTES 的对应关系
+
+SimpleTES 的核心不是“让模型想更久”,而是把 test-time compute 花在
+`propose -> evaluate -> refine` 的评估驱动循环上。dopforge 的对应如下:
+
+| SimpleTES 概念 | dopforge 对应 |
+|---|---|
+| Global width `C` | `Budget.C`: 并行 lineage 数 |
+| Refinement depth `L` | `Budget.L`: 每条 lineage 的迭代代数 |
+| Local samples `K` | `Budget.K`: 每代从同一父代生成 K 个候选 |
+| Proposal / refinement | `dopharness.Run` 通过工具修改 Markdown chunk |
+| Evaluator | `Pipeline`: hard gates + `LLMJudgeStage` |
+| Scalar score | `Score.Value(dimensions)`: 多维 LLM 分数的 weighted scalar proxy |
+| Local selection | `PickBestInBatch`: 在通过硬门槛的 K 个候选中选 scalar proxy 最高者 |
+| Best trajectory history | `Trajectory`: 记录每代 picked candidate、scalar proxy、soft vector 和 notes |
+| Diversity / final choice | `GlobalFrontier`: 合并各 lineage 的 Pareto 前沿 |
+
+与论文最大的差异是:论文中的很多任务有可靠的程序化标量评价,而方法论质量只能依赖
+LLM 多维启发式 judge。为了避免偏离 SimpleTES 的搜索动力,当前版本做了折中:
+
+- 搜索内部使用 `Score.Value` 作为稳定 scalar proxy,对齐 SimpleTES 的局部选择假设。
+- 最终输出仍使用 Pareto Frontier,避免把方法论质量过早压成单一分数。
+- hard gates 尽量保持确定性,用于防止 reward hacking,例如禁止生成 Go module、run.sh、Dockerfile 等工程脚手架。
+
+## 包结构
+
+```text
+dopforge/
+├── README.md
+├── goal.go                         # Goal、Dimension、HardGate
+├── candidate.go                    # Candidate、Score、Workspace
+├── evaluate.go                     # Pipeline、ShellGate、LLMJudgeStage
+├── search.go                       # C×L×K 主循环、scalar proxy、Pareto、Trajectory
+├── forge.go                        # Forge 门面、dopharness Mutator、SharedMemory
+├── main/
+│   └── main.go                     # CLI 入口,接 doptime/llm
+└── examples/
+    └── learning_methodology/
+        └── goal.json               # 示例任务:如何学习的方法论
+```
+
+注意:项目根目录不再保留 `goal.json`,`main/goal.json` 也已删除。所有具体任务配置都放到
+`examples/<task>/goal.json`,避免框架意图和任务意图混淆。
+
+## 配置文件
+
+配置文件现在分成 `run` 和 `goal` 两层:
+
+```json
+{
+  "run": {
+    "name": "learning-methodology",
+    "work_dir": "./runs/learning-methodology",
+    "seed_dir": "./seeds/learning-methodology",
+    "artifact": "METHOD.md"
+  },
+  "goal": {
+    "description": "...",
+    "llm_judge_rubric": "...",
+    "dimensions": [
+      { "name": "clarity", "higher_is_better": true, "weight": 1.0 }
+    ],
+    "hard_gates": [
+      { "name": "artifact_exists", "cmd": ["bash", "-c", "test -f METHOD.md"], "timeout": "5s" }
+    ]
+  }
+}
+```
+
+`run.work_dir` 用来集中存放全部中间结果,包括候选目录、共享 skills 和 trajectory:
+
+```text
+runs/<name>/
+├── L0/c00001/...
+├── L1/c00002/...
+├── .shared/skills/...
+└── trajectory.json
+```
+
+命令行参数可以覆盖配置文件:
+
+```bash
+go run ./main -config ./examples/learning_methodology/goal.json
+
+go run ./main \
+  -config ./examples/learning_methodology/goal.json \
+  -work ./runs/learning-methodology-exp2 \
+  -C 4 -L 6 -K 3
+```
+
+优先级:
+
+```text
+命令行参数 > 配置文件 run 字段 > 默认值
+```
+
+为了兼容旧版本,`-goal` 仍可作为 `-config` 的别名,但新代码和文档都推荐使用 `-config`。
+
+## 运行方式
+
+```bash
+# 最小预算验证流程
+go run ./main -config ./examples/learning_methodology/goal.json -C 2 -L 2 -K 2
+
+# 放大探索
+go run ./main -config ./examples/learning_methodology/goal.json -C 4 -L 6 -K 3
+```
+
+如果 `run.seed_dir` 为空或不存在 Markdown 文件,CLI 会创建一个最小 `METHOD.md` 种子。
+它不会创建 `go.mod`、`main.go`、`run.sh` 或任何沙盒运行环境。
+
+## dopharness 接口契约
+
+集成方只需要关心稳定入口:
+
+```go
+// 包路径 github.com/doptime/dopharness/harness
+type Harness struct{ /* opaque */ }
+
+func New(cfg Config) (*Harness, error)
+func (h *Harness) Index(ctx) (*index.Report, error)
+func (h *Harness) AsLLMTools(builder tools.ToolBuilder) []any
+func (h *Harness) Run(ctx, userPrompt) (*RunReport, error)
+func (h *Harness) Memory() *memory.Memory
+```
+
+生命周期:
+
+```text
+New -> Index -> AsLLMTools(builder) -> Run
+```
+
+三类 LLM caller:
+
+```go
+// gateway 包
+type TriageCaller func(p TriagePromptParams, sink func(*TriageDecisionPayload)) error
+type ExpandCaller func(p ExpandPromptParams, sink func(*ExpandDecisionPayload)) error
+
+// harness 包
+type MainCaller func(systemPrompt, userPrompt string, tools []any) error
+```
+
+工具桥接:
+
+```go
+type ToolBuilder interface {
+    Build(name, desc string, handler any) any
+}
+```
+
+dopharness 默认暴露 `modify_chunk / delete_chunk / add_chunk / create_file / delete_file /
+read_chunk / search_chunks_by_name`。dopforge 的 prompt 会约束这些工具只用于 Markdown 方法论文档。
+
+## 设计原则
+
+### 1. 搜索内部需要 scalar proxy
+
+SimpleTES 的局部选择依赖可比较分数。方法论任务没有天然程序化评分,但如果完全只用 Pareto,
+K 内选择会过于松散,停滞判断也会不稳定。因此当前版本将多维 LLM judge 分数通过
+`Score.Value(dimensions)` 转成 weighted scalar proxy,用于局部选择和 trajectory。
+
+### 2. 最终结果保留 Pareto Frontier
+
+方法论质量天然多目标:清晰、可执行、深度、适配性、Markdown 质量不一定同向。最终仍输出
+Pareto 前沿,避免唯一标量把候选过早压扁。
+
+### 3. Hard gates 用来防 reward hacking
+
+LLM judge 是启发式评价,容易被格式、话术或无关工程脚手架欺骗。因此默认示例用确定性 shell
+检查约束产物:
+
+- 必须有 `METHOD.md`
+- 必须有基本 Markdown 结构
+- 顶层只能有 Markdown 文件
+- 不能生成 `go.mod/main.go/run.sh/package.json/Dockerfile`
+
+### 4. 运行目录属于任务配置
+
+多项目探索时,中间结果必须隔离。`run.work_dir` 进入配置文件后,每个探索项目都可以拥有独立
+`runs/<name>` 目录,不会互相覆盖。
+
+## 许可
+
+MIT(待定)。
+
+===== ./main/main_learning_methodology.go =====
+// Command main_learning_methodology 是 dopforge 在"如何学习的方法论"
+// 这一具体项目下的入口。
+//
+// 设计原则:
+//   - 所有 goal、run、维度、硬门槛都内联在本文件顶部"项目级配置"段,
+//     不再读取外部 goal.json。不同项目复制本文件并仅修改该段即可。
+//   - 所有中间产物(候选 workdirs、共享 skills、trajectory.json)统一
+//     写入 workDir,不向工程根目录散落任何运行期文件。
+//   - 默认产物是 METHOD.md;不会生成 go.mod、main.go、run.sh 等可执行
+//     脚手架。
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"text/template"
+	"time"
+
+	df "github.com/doptime/dopforge"
+	"github.com/doptime/dopharness/gateway"
+	"github.com/doptime/dopharness/tools"
+	"github.com/doptime/llm"
+)
+
+// ============================================================
+// 项目级配置:复制本文件后,只改这一段
+// ============================================================
+
+const (
+	runName  = "learning-methodology"
+	workDir  = "./runs/learning-methodology"
+	seedDir  = "./seeds/learning-methodology"
+	artifact = "METHOD.md"
+
+	judgeReplicas = 3
+)
+
+var (
+	genModel   = llm.Qwen36_35ba3b
+	judgeModel = llm.Qwen3627b
+)
+
+const goalDescription = `生成并迭代一篇中文 Markdown 方法论文档。主题是"如何学习的方法论"。
+最终产物必须以 METHOD.md 为主,可以有少量辅助 .md 笔记,但不要生成 Go 项目、代码文件、shell
+脚本、沙盒运行环境、package manifest、Dockerfile 或可执行应用。文档应面向真实学习者,强调
+可执行流程、练习设计、反馈机制、复盘迭代、迁移应用和常见误区。`
+
+const judgeRubric = `Score each dimension in [0,1].
+- clarity: 结构是否清晰? 概念是否有边界? 读者能否快速知道先做什么、后做什么?
+- actionability: 是否有可执行步骤、检查清单、练习模板、反馈渠道和复盘流程?
+- depth: 是否解释了学习的认知机制、迁移、刻意练习、反馈闭环和抗遗忘,而不只是鸡汤?
+- adaptability: 是否能适配不同学科、不同阶段、不同时间预算?
+- markdown_quality: Markdown 层级、标题、列表、表格、示例是否规范,是否适合继续迭代?
+Critique should point at METHOD.md section names or line numbers if possible. Suggest one
+concrete next change. Penalize any generated code project, sandbox, Go module, shell
+runner, or executable app scaffolding.`
+
+func dimensions() []df.Dimension {
+	return []df.Dimension{
+		{Name: "clarity", HigherIsBetter: true, Weight: 1.0},
+		{Name: "actionability", HigherIsBetter: true, Weight: 1.0},
+		{Name: "depth", HigherIsBetter: true, Weight: 0.9},
+		{Name: "adaptability", HigherIsBetter: true, Weight: 0.7},
+		{Name: "markdown_quality", HigherIsBetter: true, Weight: 0.6},
+	}
+}
+
+func hardGates() []df.HardGate {
+	const t = 5 * time.Second
+	return []df.HardGate{
+		df.ShellGate{
+			GateName: "artifact_exists",
+			Cmd:      []string{"bash", "-c", "test -f " + artifact},
+			Timeout:  t,
+		},
+		df.ShellGate{
+			GateName: "artifact_has_substance",
+			Cmd:      []string{"bash", "-c", "test $(wc -c < " + artifact + ") -gt 1000"},
+			Timeout:  t,
+		},
+		df.ShellGate{
+			GateName: "artifact_has_markdown_structure",
+			Cmd: []string{"bash", "-c",
+				"grep -q '^# ' " + artifact +
+					" && test $(grep -c '^## ' " + artifact + ") -ge 4"},
+			Timeout: t,
+		},
+		// 顶层只允许 .md/.markdown,这一条已经隐含"无 go.mod / main.go /
+		// run.sh / package.json / Dockerfile",所以原来的 5 条 gate 在此
+		// 简化为 4 条。
+		df.ShellGate{
+			GateName: "markdown_only_top_level",
+			Cmd: []string{"bash", "-c",
+				"find . -maxdepth 1 -type f ! -name '*.md' ! -name '*.markdown' | grep -q . && exit 1 || exit 0"},
+			Timeout: t,
+		},
+		df.ContentGate{
+			GateName: "prose_not_bullet_dump",
+			Artifact: artifact,
+			CheckFn: func(content string) error {
+				lines := strings.Split(content, "\n")
+				bullets, nonempty := 0, 0
+				for _, l := range lines {
+					t := strings.TrimSpace(l)
+					if t == "" {
+						continue
+					}
+					nonempty++
+					if strings.HasPrefix(t, "- ") || strings.HasPrefix(t, "* ") || strings.HasPrefix(t, "+ ") {
+						bullets++
+					}
+				}
+				if nonempty == 0 {
+					return nil
+				}
+				if r := float64(bullets) / float64(nonempty); r > 0.70 {
+					return fmt.Errorf("bullet/line ratio %.2f > 0.70; methodology must contain prose, tables or worked examples, not just lists", r)
+				}
+				return nil
+			},
+		},
+	}
+}
+
+// 一份"及格但平庸"的种子方法论。让搜索从一份能跑通所有 hard gate、
+// 但深度浅、例子少、模板缺的方法论起步,而不是从满篇"待补充"起步。
+// 这样每一代的 judge 反馈才能落到"在哪一节加什么"的具体改动上。
+const defaultMethodologySeed = `# 学习方法论(基线版)
+
+## 1. 适用对象
+
+本方法论面向需要在数月到数年时间尺度上掌握一门具体学科或技能的成年学习者。
+不适用于纯应试备考、短期记忆突击,以及完全不需要反馈即可验证掌握度的领域。
+
+## 2. 核心原则
+
+1. 以输出为锚:每一阶段都必须落到一个可被外部检验的产物
+2. 小步反馈:把闭环时长压缩到 24 小时以内
+3. 区分"还在学"和"已经能在新场景里用"
+4. 抗遗忘优先:保留率 > 一次性吸收量
+
+## 3. 操作流程
+
+1. 目标拆解:把学习目标拆到"做什么任务能证明已掌握"的层级
+2. 基线测评:用一道真实任务测当前水平,记录耗时和错误类型
+3. 刻意练习:针对错误类型设计练习,每次只挑战 1~2 个弱点
+4. 复盘:每次练习后写一段 50~200 字的复盘
+5. 间隔重做:在 1 天 / 3 天 / 7 天 / 21 天的节点重做近似任务
+
+## 4. 练习与反馈
+
+练习模板:输入条件、动作、预期输出、判错标准。
+反馈渠道按可获得性排序:自检 → 同行评议 → 专家点评 → 真实环境后果。
+当连续 3 次练习无新增错误类型,提升任务难度而不是重复同等任务。
+
+## 5. 复盘与迭代
+
+每周做一次 30 分钟的复盘,列出"以为会但实际不会"的点,
+并把对方法论本身的修改写回本文档,使方法论本身随实践演化。
+
+## 6. 常见误区
+
+- 把"看完一本书"等同于"学会"
+- 用阅读量替代练习量
+- 在没有反馈的情况下重复练习,固化错误模式
+- 追求覆盖广度而忽略迁移应用
+`
+
+// ============================================================
+// 入口
+// ============================================================
+
+func main() {
+	var (
+		C = flag.Int("C", 2, "parallel lineages")
+		L = flag.Int("L", 2, "generations per lineage")
+		K = flag.Int("K", 2, "children per generation")
+	)
+	flag.Parse()
+
+	g := &df.Goal{
+		Description:    goalDescription,
+		LLMJudgeRubric: judgeRubric,
+		Dimensions:     dimensions(),
+		HardGates:      hardGates(),
+	}
+
+	log.Printf("run %q: artifact=%s seed=%s work=%s dims=%d gates=%d",
+		runName, artifact, seedDir, workDir, len(g.Dimensions), len(g.HardGates))
+
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		log.Fatalf("mkdir workDir: %v", err)
+	}
+	if err := ensureSeed(seedDir, artifact); err != nil {
+		log.Fatalf("ensure seed: %v", err)
+	}
+
+	callers := buildCallers()
+
+	pipeline := &df.Pipeline{
+		HardStages: df.WrapHardGates(g.HardGates),
+		SoftStages: []df.Stage{&df.LLMJudgeStage{
+			Goal:           g,
+			Caller:         callers.judge,
+			FilesToInclude: collectMarkdownFiles,
+			Replicas:       judgeReplicas,
+		}},
+	}
+
+	sm, err := df.NewSharedMemory(df.SharedMemoryConfig{
+		SkillsDir: filepath.Join(workDir, ".shared", "skills"),
+		Goal:      g,
+	})
+	if err != nil {
+		log.Fatalf("shared memory: %v", err)
+	}
+
+	f, err := df.New(df.Config{
+		Goal:           g,
+		SeedDir:        seedDir,
+		WorkRoot:       workDir,
+		TriageCaller:   callers.triage,
+		MainCaller:     callers.main,
+		ToolBuilder:    callers.toolBuilder,
+		Pipeline:       pipeline,
+		SharedMemory:   sm,
+		SkillDistiller: callers.distiller,
+		Logger: func(event string, fields map[string]any) {
+			log.Printf("[%s] %v", event, fields)
+		},
+	})
+	if err != nil {
+		log.Fatalf("forge new: %v", err)
+	}
+
+	ctx := context.Background()
+	res, err := f.Run(ctx, df.Budget{C: *C, L: *L, K: *K})
+	if err != nil {
+		log.Fatalf("forge run: %v", err)
+	}
+
+	if err := res.Trajectory.Save(workDir); err != nil {
+		log.Printf("save trajectory: %v", err)
+	}
+
+	fmt.Printf("\n=== Pareto Frontier (%d candidates) ===\n", len(res.Frontier))
+	for _, c := range res.Frontier {
+		fmt.Printf("\n  %s @ L%d gen%d\n  workdir: %s\n  scalar_proxy: %.4f\n",
+			c.ID, c.Lineage, c.Generation, c.WorkDir, c.Score.Value(g.Dimensions))
+		for k, v := range c.Score.Soft {
+			fmt.Printf("    %-30s %.4f\n", k, v)
+		}
+	}
+	fmt.Printf("\nReview %q in the workdirs above. All run artifacts are under: %s\n",
+		artifact, workDir)
+}
+
+// ============================================================
+// LLM Caller 集合
+// ============================================================
+
+type callerSet struct {
+	triage      gateway.TriageCaller
+	main        func(systemPrompt, userPrompt string, toolList []any) error
+	judge       df.JudgeCaller
+	toolBuilder tools.ToolBuilder
+	distiller   df.SkillDistiller
+}
+
+func buildCallers() *callerSet {
+	return &callerSet{
+		triage:      doptimeTriageCaller,
+		main:        doptimeMainCaller,
+		judge:       doptimeJudgeCaller,
+		toolBuilder: doptimeToolBuilder(),
+		distiller:   doptimeDistiller,
+	}
+}
+
+func doptimeToolBuilder() tools.ToolBuilder {
+	return tools.ToolBuilderFunc(func(name, desc string, handler any) any {
+		switch h := handler.(type) {
+		case func(*tools.ModifyChunkPayload):
+			return llm.NewTool(name, desc, h)
+		case func(*tools.DeleteChunkPayload):
+			return llm.NewTool(name, desc, h)
+		case func(*tools.AddChunkPayload):
+			return llm.NewTool(name, desc, h)
+		case func(*tools.CreateFilePayload):
+			return llm.NewTool(name, desc, h)
+		case func(*tools.DeleteFilePayload):
+			return llm.NewTool(name, desc, h)
+		case func(*tools.ReadChunkPayload):
+			return llm.NewTool(name, desc, h)
+		case func(*tools.SearchChunksByNamePayload):
+			return llm.NewTool(name, desc, h)
+		}
+		panic(fmt.Sprintf("unknown handler type: %T", handler))
+	})
+}
+
+func doptimeTriageCaller(p gateway.TriagePromptParams, sink func(*gateway.TriageDecisionPayload)) error {
+	tpl := template.Must(template.New("triage").Parse(`你是方法论文档上下文筛选助手。用户任务:
+{{.UserPrompt}}
+
+候选 chunk(格式: id | kind | name | signature | refs):
+{{range .Views}}{{.ID}} | {{.Kind}} | {{.Name}} | {{.Signature}} | {{.Refs}}
+{{end}}
+
+对每个 chunk 通过 TriageDecision 工具提交判断:
+- 即将被修改的 Markdown 章节 → FULL
+- 被将要修改章节引用、定义术语、或提供必要上下文的章节 → SKELETON
+- 与本次方法论改进无关的内容 → IGNORE
+
+优先选择 .md/.markdown 里的章节。不要因为任务提到"实现"就扩大到生成代码项目。`))
+
+	var payload *gateway.TriageDecisionPayload
+	tool := llm.NewTool("TriageDecision", "提交 chunk 裁定", func(p *gateway.TriageDecisionPayload) {
+		payload = p
+	})
+	agent := llm.NewAgent(tpl, tool).UseModels(genModel)
+	if err := agent.Call(map[string]any{
+		"UserPrompt": p.UserPrompt,
+		"Views":      p.Views,
+	}); err != nil {
+		return err
+	}
+	if payload == nil {
+		return fmt.Errorf("triage: LLM did not call TriageDecision tool")
+	}
+	sink(payload)
+	return nil
+}
+
+func doptimeMainCaller(systemPrompt, userPrompt string, toolList []any) error {
+	tpl := template.Must(template.New("main").Parse(`{{.UserPrompt}}`))
+
+	llmTools := make([]llm.ToolInterface, 0, len(toolList))
+	for _, t := range toolList {
+		llmTools = append(llmTools, t.(llm.ToolInterface))
+	}
+
+	agent := llm.NewAgent(tpl).UseModels(genModel)
+	for _, t := range llmTools {
+		agent.UseTools(t)
+	}
+	return agent.Call(map[string]any{
+		"UserPrompt": systemPrompt + "\n\n" + userPrompt,
+	})
+}
+
+func doptimeJudgeCaller(ctx context.Context, prompt string) (string, error) {
+	tpl := template.Must(template.New("judge").Parse(`{{.Prompt}}`))
+
+	var rawReply string
+	tool := llm.NewTool(
+		"SubmitJudgement",
+		"提交完整的 JSON 评分(包在 ```json fenced block 内的字符串)",
+		func(p *struct {
+			RawText string `json:"raw_text" comment:"the full JSON response, fenced or not"`
+		}) {
+			rawReply = p.RawText
+		},
+	)
+	agent := llm.NewAgent(tpl, tool).UseModels(judgeModel)
+	if err := agent.Call(map[string]any{"Prompt": prompt}); err != nil {
+		return "", err
+	}
+	if rawReply == "" {
+		return "", fmt.Errorf("judge: LLM returned empty raw_text")
+	}
+	return rawReply, nil
+}
+
+func doptimeDistiller(ctx context.Context, winner, parent *df.Candidate) (key, content string, err error) {
+	if winner.Score == nil || winner.Score.Notes == "" {
+		return "", "", nil
+	}
+	key = fmt.Sprintf("methodology_gen%d_lineage%d", winner.Generation, winner.Lineage)
+	var sb strings.Builder
+	sb.WriteString("# Methodology improvement skill from ")
+	sb.WriteString(winner.ID)
+	sb.WriteString("\n\n")
+	sb.WriteString("## When this applies\n\n")
+	sb.WriteString("Use this when improving a Markdown methodology document under a multi-dimensional judge.\n\n")
+	sb.WriteString("## Scalar proxy context\n\n")
+	sb.WriteString(fmt.Sprintf("This candidate entered a Pareto frontier with scalar proxy %.4f.\n\n", winner.Score.Value(nil)))
+	sb.WriteString("## What seemed to work\n\n")
+	sb.WriteString(winner.Score.Notes)
+	sb.WriteString("\n\n## Reuse rule\n\n")
+	sb.WriteString("Turn the critique into concrete section edits, examples, checklists, or review loops. Do not convert the document into software.\n")
+	return key, sb.String(), nil
+}
+
+// ============================================================
+// 工具函数
+// ============================================================
+
+// collectMarkdownFiles 扫候选解 workdir,只把 Markdown 文件交给 LLM 法官。
+func collectMarkdownFiles(dir string) (map[string]string, error) {
+	out := map[string]string{}
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, p)
+		if strings.HasPrefix(rel, ".") {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(p))
+		switch ext {
+		case ".md", ".markdown":
+		default:
+			return nil
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		s := string(data)
+		if len(s) > 12000 {
+			s = s[:6000] + "\n... [truncated] ...\n" + s[len(s)-6000:]
+		}
+		out[rel] = s
+		return nil
+	})
+	return out, err
+}
+
+// ensureSeed 保证 seed 目录存在且至少有一个 Markdown artifact。
+func ensureSeed(dir, docName string) error {
+	if docName == "" {
+		docName = "METHOD.md"
+	}
+	if filepath.Ext(docName) == "" {
+		docName += ".md"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	hasMarkdown := false
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			ext := strings.ToLower(filepath.Ext(e.Name()))
+			if ext == ".md" || ext == ".markdown" {
+				hasMarkdown = true
+				break
+			}
+		}
+	}
+	if hasMarkdown {
+		return nil
+	}
+
+	return os.WriteFile(filepath.Join(dir, docName), []byte(defaultMethodologySeed), 0o644)
+}
+
+===== ./candidate.go =====
+package dopforge
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync/atomic"
+	"time"
+)
+
+// ============================================================
+// Candidate:一份正在演化的方法论候选版本
+// ============================================================
+//
+// 一个 Candidate 等于一个独立工作目录(WorkDir),里面通常是一组 Markdown 文档,
+// 最常见的是 METHOD.md。它有稳定 ID、父代记录、分数。
+//
+// 关键不变量:
+//   - WorkDir 是一个 cp -a 出来的独立目录,拥有自己的 .dopharness/ 子目录
+//   - Parent 永远指向创造它的那一份,根候选解 Parent == nil
+//   - Score 在评估前为 nil,评估后不应再被改写
+
+var idCounter uint64
+
+type Candidate struct {
+	ID         string     // 全局唯一,形如 "c00007"
+	Lineage    int        // 属于第几条 lineage(C 路并行的某一路)
+	Generation int        // 在 lineage 内的代数(L 轮的第几轮)
+	Parent     *Candidate // 父代;根候选解为 nil
+	WorkDir    string     // 独立工作目录的绝对路径
+
+	// PromptLog 记录 mutate 这一步送给 LLM 的 user prompt。
+	// 不参与决策,仅用于审计/调试。
+	PromptLog string
+
+	// Score 由 Pipeline.Evaluate 写入;nil 表示尚未评估。
+	Score *Score
+
+	CreatedAt time.Time
+}
+
+// NewCandidate 构造一个新候选解(WorkDir 由 Workspace 决定)。
+func NewCandidate(lineage, generation int, parent *Candidate) *Candidate {
+	id := atomic.AddUint64(&idCounter, 1)
+	return &Candidate{
+		ID:         fmt.Sprintf("c%05d", id),
+		Lineage:    lineage,
+		Generation: generation,
+		Parent:     parent,
+		CreatedAt:  time.Now(),
+	}
+}
+
+// ============================================================
+// Score:多维评分向量 + SimpleTES 风格标量代理
+// ============================================================
+//
+// 设计核心:最终结果仍用 Pareto 前沿保留多目标多样性;但搜索内部需要一个稳定的
+// scalar proxy,用于 K 个兄弟之间的局部选择、日志和停滞判断。这一点对齐 SimpleTES
+// 原论文中“评估产生可比较分数”的假设,同时不牺牲方法论任务的多维评价表达。
+
+type Score struct {
+	// Hard 列出每条硬门槛的检查结果。任意 Err != nil 视为整体不通过。
+	Hard []GateResult
+
+	// Soft 是按 Goal.Dimensions 给出的多维分数。键名严格对齐 Dimension.Name。
+	Soft map[string]float64
+
+	// Notes 是评估器(典型是 LLM judge)给出的文字反馈。会被原样回灌进下一轮 mutate。
+	Notes string
+}
+
+// GateResult 是一条硬门槛的判定结果。
+type GateResult struct {
+	Name string
+	Err  error // nil 表示通过
+}
+
+// Passed 当且仅当所有硬门槛都通过。
+func (s *Score) Passed() bool {
+	if s == nil {
+		return false
+	}
+	for _, g := range s.Hard {
+		if g.Err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// Value returns the scalar proxy used for SimpleTES-style local selection and
+// trajectory logging. The raw evaluation remains multi-dimensional and Pareto is
+// still used for the final frontier; this scalar is only a stable search signal.
+//
+// For dimensions where HigherIsBetter=false, the value is negated. In the common
+// methodology-use case all LLM judge dimensions are normalized to [0,1] with
+// higher-is-better, so Value is simply a weighted average.
+func (s *Score) Value(dims []Dimension) float64 {
+	if s == nil || len(s.Soft) == 0 {
+		return -1e18
+	}
+	if len(dims) == 0 {
+		total := 0.0
+		n := 0.0
+		for _, v := range s.Soft {
+			total += v
+			n++
+		}
+		if n == 0 {
+			return -1e18
+		}
+		return total / n
+	}
+
+	total := 0.0
+	weightSum := 0.0
+	for _, d := range dims {
+		w := d.Weight
+		if w == 0 {
+			w = 1
+		}
+		v := s.Soft[d.Name]
+		if !d.HigherIsBetter {
+			v = -v
+		}
+		total += w * v
+		weightSum += w
+	}
+	if weightSum == 0 {
+		return total
+	}
+	return total / weightSum
+}
+
+// Dominates 判断 s 在帕累托意义上是否支配 other。
+// 规则:每一维都不差于 other,且至少一维严格优于。
+// 没通过硬门槛的 Score 不参与帕累托比较。
+func (s *Score) Dominates(other *Score, dims []Dimension) bool {
+	if s == nil || other == nil {
+		return false
+	}
+	if !s.Passed() || !other.Passed() {
+		return false
+	}
+	strictlyBetter := false
+	for _, d := range dims {
+		a, b := s.Soft[d.Name], other.Soft[d.Name]
+		if d.HigherIsBetter {
+			if a < b {
+				return false
+			}
+			if a > b {
+				strictlyBetter = true
+			}
+		} else {
+			if a > b {
+				return false
+			}
+			if a < b {
+				strictlyBetter = true
+			}
+		}
+	}
+	return strictlyBetter
+}
+
+// ============================================================
+// Workspace:候选解物理目录管理
+// ============================================================
+//
+// 设计要点:
+//   - 每个 Candidate 在磁盘上是 <Root>/L<lineage>/<id>/ 一份完整副本
+//   - fork 时 cp -a,不做 git 也不做 union mount
+//   - 副本里包含 .dopharness/ chunk store,所以增量索引能延续
+//   - 副本里也包含 .dopharness/memory/sessions/,所以 lineage 内 L4 历史自动继承
+
+type Workspace struct {
+	Root    string // 例:./.forge_work
+	SeedDir string // 第一代候选解从这里 cp;空则白板起步
+}
+
+// NewWorkspace 构造并保证 Root 存在。
+func NewWorkspace(root, seedDir string) (*Workspace, error) {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, fmt.Errorf("workspace: mkdir root: %w", err)
+	}
+	if seedDir != "" {
+		if _, err := os.Stat(seedDir); err != nil {
+			return nil, fmt.Errorf("workspace: seed dir %s: %w", seedDir, err)
+		}
+	}
+	return &Workspace{Root: root, SeedDir: seedDir}, nil
+}
+
+// Materialize 给 Candidate 生成 WorkDir 并把内容拷进去。
+//
+// 拷贝源:有 Parent 时取 Parent.WorkDir,否则取 SeedDir,都没有就建空目录。
+// .dopharness/ 子目录会一并继承,使 chunk store 和 L4 sessions 都跨代连续。
+func (w *Workspace) Materialize(c *Candidate) error {
+	dst := filepath.Join(w.Root, fmt.Sprintf("L%d", c.Lineage), c.ID)
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("workspace: mkdir %s: %w", dst, err)
+	}
+	var src string
+	switch {
+	case c.Parent != nil:
+		src = c.Parent.WorkDir
+	case w.SeedDir != "":
+		src = w.SeedDir
+	}
+	if src != "" {
+		if err := copyDir(src, dst); err != nil {
+			return fmt.Errorf("workspace: copy %s -> %s: %w", src, dst, err)
+		}
+	}
+	c.WorkDir = dst
+	return nil
+}
+
+// Cleanup 删除 Candidate 的物理目录。不要清理还在被引用为 Parent 的候选。
+func (w *Workspace) Cleanup(c *Candidate) error {
+	if c.WorkDir == "" {
+		return nil
+	}
+	return os.RemoveAll(c.WorkDir)
+}
+
+// copyDir 优先用系统 cp -a,fallback 到纯 Go 递归拷贝。
+func copyDir(src, dst string) error {
+	if _, err := exec.LookPath("cp"); err == nil {
+		cmd := exec.Command("cp", "-a", src+"/.", dst)
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, p)
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		return copyFile(p, target, info.Mode())
+	})
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+===== ./goal.go =====
+// Package dopforge 是 dopharness 之上的方法论搜索引擎。
+//
+// 核心思想:你描述“想得到什么方法论”和“怎么算好”(Goal),不描述具体写法;
+// dopforge 用 SimpleTES 风格的 C×L×K 三轴搜索 + 多维 Pareto 评分驱动 LLM
+// 对 Markdown 方法论文档进行多路线迭代,最终给你一组互不支配的精英版本。
+//
+// 文件分工:
+//
+//	goal.go      —— 描述任务:意图、维度、硬门槛
+//	candidate.go —— Candidate + Score + Workspace
+//	evaluate.go  —— Pipeline + ShellGate + LLMJudgeStage
+//	search.go    —— C×L×K 主循环 + Pareto 前沿 + 停滞检测 + 轨迹记录
+//	forge.go     —— Forge 顶层门面 + 跨 lineage 共享记忆
+package dopforge
+
+// Goal 是用户唯一必须仔细写的东西。
+//
+// 设计哲学:在这里描述“是什么”和“怎么算好”,不描述“怎么写”。
+// 后者交给搜索引擎探索。对于方法论任务,Description 应明确输出物、读者、
+// 禁区和风格边界,例如:“输出单个 METHOD.md;不要生成代码项目或运行脚本”。
+type Goal struct {
+	// Description 是给 LLM 看的自然语言意图。
+	// 应当包含:主题、目标读者、输出形态、风格偏好、显式禁区。
+	Description string
+
+	// HardGates 是一组硬门槛。任何一条不通过,候选解不会进入 Pareto 前沿。
+	// 对方法论文档任务,典型门槛是:METHOD.md 存在、非空、没有 go.mod/run.sh 等工程文件。
+	HardGates []HardGate
+
+	// Dimensions 声明多维评分轴及方向。评估器返回的 Soft map 必须覆盖这里的所有维度。
+	// 搜索本身不依赖 Weight,Weight 只在同 batch 多个非支配候选并列时做 tiebreak。
+	Dimensions []Dimension
+
+	// LLMJudgeRubric 给 LLM 法官看的评分细则。空则不启用 LLM 软评分。
+	LLMJudgeRubric string
+}
+
+// Dimension 是一个评分轴。
+type Dimension struct {
+	Name           string
+	HigherIsBetter bool
+	Weight         float64 // tiebreak 用,可空
+}
+
+// HardGate 是一条硬门槛检查器。
+//
+// 实现方拿到候选解的 workDir,自己决定怎么验证。返回 nil 即通过。
+// 对文档任务,建议尽量使用轻量、确定性的 shell 检查,而不是运行沙盒。
+type HardGate interface {
+	Name() string
+	Check(workDir string) error
+}
+
+// HardGateFunc 把一个普通函数包成 HardGate。
+type HardGateFunc struct {
+	N string
+	F func(workDir string) error
+}
+
+func (g HardGateFunc) Name() string               { return g.N }
+func (g HardGateFunc) Check(workDir string) error { return g.F(workDir) }
+
+===== ./evaluate.go =====
+package dopforge
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ============================================================
+// 评估层:Pipeline + Stage
+// ============================================================
+//
+// 评估的核心论点是:不强行返回标量奖励。方法论质量天然是多目标启发式判断,
+// 折成单分会把偏见注入选择压力。
+//
+// 替代方案:
+//   1) HardGate     —— 硬门槛(布尔),不通过即无法进入 Pareto 前沿
+//   2) Soft Stages  —— 多维数值(向量),Pareto 直接消费
+
+type Stage interface {
+	Name() string
+	Run(ctx context.Context, c *Candidate) StageOutput
+}
+
+// StageOutput 是单个 Stage 的产出。
+// 任意 Stage 都可以贡献多个 Soft 维度。HardErr != nil 表示该 Stage 拒绝候选。
+type StageOutput struct {
+	HardErr error
+	Soft    map[string]float64
+	Notes   string
+}
+
+// Pipeline 串联多个 Stage,产出最终 Score。
+//
+// 顺序:HardStages 先于 SoftStages。但即便 Hard 失败,Soft 也仍会跑——这样 LLM
+// 拿到的 Notes 里既有“为什么不通过”,也有“如果通过该怎么变好”。
+type Pipeline struct {
+	HardStages []Stage
+	SoftStages []Stage
+	Goal       *Goal // 用于在 Soft 维度缺失时填默认值
+}
+
+// Evaluate 实现完整评估。
+func (p *Pipeline) Evaluate(ctx context.Context, c *Candidate) (*Score, error) {
+	score := &Score{Soft: make(map[string]float64)}
+	var notes []string
+
+	for _, st := range p.HardStages {
+		out := st.Run(ctx, c)
+		score.Hard = append(score.Hard, GateResult{Name: st.Name(), Err: out.HardErr})
+		mergeSoft(score.Soft, out.Soft)
+		if out.Notes != "" {
+			notes = append(notes, fmt.Sprintf("[%s] %s", st.Name(), out.Notes))
+		}
+	}
+	for _, st := range p.SoftStages {
+		out := st.Run(ctx, c)
+		mergeSoft(score.Soft, out.Soft)
+		if out.Notes != "" {
+			notes = append(notes, fmt.Sprintf("[%s] %s", st.Name(), out.Notes))
+		}
+	}
+
+	if p.Goal != nil {
+		for _, d := range p.Goal.Dimensions {
+			if _, ok := score.Soft[d.Name]; !ok {
+				if d.HigherIsBetter {
+					score.Soft[d.Name] = 0
+				} else {
+					score.Soft[d.Name] = 1e9
+				}
+			}
+		}
+	}
+	score.Notes = strings.Join(notes, "\n")
+	return score, nil
+}
+
+func mergeSoft(dst, src map[string]float64) {
+	for k, v := range src {
+		dst[k] = v
+	}
+}
+
+// ============================================================
+// 把 goal.HardGate 包成 Stage
+// ============================================================
+
+type hardGateStage struct{ g HardGate }
+
+// WrapHardGates 把 Goal 的硬门槛全部包成 Stage 列表。
+func WrapHardGates(gs []HardGate) []Stage {
+	out := make([]Stage, 0, len(gs))
+	for _, g := range gs {
+		out = append(out, &hardGateStage{g: g})
+	}
+	return out
+}
+
+func (s *hardGateStage) Name() string { return s.g.Name() }
+func (s *hardGateStage) Run(ctx context.Context, c *Candidate) StageOutput {
+	if err := s.g.Check(c.WorkDir); err != nil {
+		return StageOutput{HardErr: err, Notes: fmt.Sprintf("FAIL: %v", err)}
+	}
+	return StageOutput{}
+}
+
+// ============================================================
+// ShellGate:开箱即用的硬门槛实现
+// ============================================================
+
+// ShellGate 跑一条 shell 命令看退出码。Cmd 在候选解的 WorkDir 下执行。
+//
+// 对方法论文档任务,建议使用确定性文件检查,例如:
+//
+//	test -f METHOD.md
+//	test ! -f go.mod && test ! -f run.sh
+//	grep -q '^##' METHOD.md
+//
+// 不建议在默认方法论任务里运行沙盒、编译或启动服务。
+type ShellGate struct {
+	GateName string
+	Cmd      []string
+	Timeout  time.Duration
+}
+
+func (g ShellGate) Name() string { return g.GateName }
+
+func (g ShellGate) Check(workDir string) error {
+	if len(g.Cmd) == 0 {
+		return fmt.Errorf("ShellGate: empty Cmd")
+	}
+	to := g.Timeout
+	if to == 0 {
+		to = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), to)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, g.Cmd[0], g.Cmd[1:]...)
+	cmd.Dir = workDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		s := string(out)
+		if len(s) > 800 {
+			s = s[:400] + "...\n[truncated]\n..." + s[len(s)-400:]
+		}
+		return fmt.Errorf("%s exit %v: %s", strings.Join(g.Cmd, " "), err, s)
+	}
+	return nil
+}
+
+// ============================================================
+// ContentGate:纯 Go 内容硬门槛
+// ============================================================
+//
+// ContentGate 在候选 workDir 下读取一个 Markdown artifact,然后用纯 Go 函数
+// 检查内容层面的强约束(关键词必现、长度区间、bullet/段落比上限等)。
+// 比 ShellGate 更便携、更可控,且把内容 sanity 校验从 LLM judge 抽到硬门槛,
+// 显著降低 judge 噪声对搜索的影响。
+
+type ContentGate struct {
+	GateName string
+	// Artifact 是 workDir 下的相对路径;空则使用 "METHOD.md"。
+	Artifact string
+	// CheckFn 拿到读取后的全文,返回 nil 即通过。
+	CheckFn func(content string) error
+}
+
+func (g ContentGate) Name() string { return g.GateName }
+
+func (g ContentGate) Check(workDir string) error {
+	if g.CheckFn == nil {
+		return fmt.Errorf("ContentGate %q: CheckFn is nil", g.GateName)
+	}
+	name := g.Artifact
+	if name == "" {
+		name = "METHOD.md"
+	}
+	data, err := os.ReadFile(filepath.Join(workDir, name))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", name, err)
+	}
+	return g.CheckFn(string(data))
+}
+
+// ============================================================
+// LLMJudgeStage:多维 LLM 法官
+// ============================================================
+//
+// 关键设计:
+//   - 法官是一个独立 LLM,与 mutate 用的不是同一只
+//   - 输出是结构化 JSON:每一维一个 [0,1] 的分,加一段 critique
+//   - 维度对齐 Goal.Dimensions 严格检查;漏维度 = 解析失败 = 该轮分数缺失
+
+// JudgeCaller 是用户提供的 LLM 单点调用函数。
+// 实现拿到完整 prompt,必须返回 LLM 回复文本(我们会从中提取 JSON 块)。
+type JudgeCaller func(ctx context.Context, prompt string) (string, error)
+
+// LLMJudgeStage 是产出 Goal.Dimensions 上多维分 + Notes 的 SoftStage。
+//
+// Replicas 控制每个候选的 judge 重复采样次数;< 1 视为 1。N>=3 时,每一维取
+// N 次返回值的中位数(对 LLM judge 噪声鲁棒),Notes 选择离中位数标量最近的
+// 那次 critique,避免 outlier critique 误导下一轮 mutate。
+type LLMJudgeStage struct {
+	Goal           *Goal
+	Caller         JudgeCaller
+	FilesToInclude func(workDir string) (map[string]string, error)
+	Replicas       int
+}
+
+func (s *LLMJudgeStage) Name() string { return "llm_judge" }
+
+func (s *LLMJudgeStage) Run(ctx context.Context, c *Candidate) StageOutput {
+	if s.Caller == nil || s.Goal == nil || s.Goal.LLMJudgeRubric == "" {
+		return StageOutput{}
+	}
+	files, err := s.FilesToInclude(c.WorkDir)
+	if err != nil {
+		return StageOutput{Notes: fmt.Sprintf("judge: collect files: %v", err)}
+	}
+	prompt := buildJudgePrompt(s.Goal, files)
+
+	n := s.Replicas
+	if n < 1 {
+		n = 1
+	}
+
+	type slot struct {
+		parsed *judgeReply
+		err    error
+	}
+	slots := make([]slot, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			reply, err := s.Caller(ctx, prompt)
+			if err != nil {
+				slots[i] = slot{err: fmt.Errorf("call: %w", err)}
+				return
+			}
+			parsed, err := parseJudgeReply(reply, s.Goal.Dimensions)
+			if err != nil {
+				slots[i] = slot{err: fmt.Errorf("parse: %w; raw: %s", err, truncate(reply, 400))}
+				return
+			}
+			slots[i] = slot{parsed: parsed}
+		}(i)
+	}
+	wg.Wait()
+
+	var ok []*judgeReply
+	var errs []string
+	for _, sl := range slots {
+		if sl.err != nil {
+			errs = append(errs, sl.err.Error())
+			continue
+		}
+		ok = append(ok, sl.parsed)
+	}
+	if len(ok) == 0 {
+		return StageOutput{Notes: "judge: all replicas failed: " + strings.Join(errs, " | ")}
+	}
+
+	// 每一维取 N 次的中位数
+	soft := make(map[string]float64, len(s.Goal.Dimensions))
+	for _, d := range s.Goal.Dimensions {
+		vals := make([]float64, 0, len(ok))
+		for _, r := range ok {
+			vals = append(vals, r.Scores[d.Name])
+		}
+		soft[d.Name] = median(vals)
+	}
+
+	// Notes 选离中位数标量最近的那次 critique
+	scalars := make([]float64, len(ok))
+	for i, r := range ok {
+		scalars[i] = (&Score{Soft: r.Scores}).Value(s.Goal.Dimensions)
+	}
+	medScalar := median(scalars)
+	bestIdx, bestDiff := 0, 1e18
+	for i, sc := range scalars {
+		d := sc - medScalar
+		if d < 0 {
+			d = -d
+		}
+		if d < bestDiff {
+			bestDiff, bestIdx = d, i
+		}
+	}
+	notes := ok[bestIdx].Critique
+	if len(errs) > 0 {
+		notes += fmt.Sprintf("\n\n[judge: %d/%d replicas failed]", len(errs), n)
+	}
+	return StageOutput{Soft: soft, Notes: notes}
+}
+
+func median(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	cp := append([]float64(nil), xs...)
+	sort.Float64s(cp)
+	n := len(cp)
+	if n%2 == 1 {
+		return cp[n/2]
+	}
+	return (cp[n/2-1] + cp[n/2]) / 2
+}
+
+type judgeReply struct {
+	Scores   map[string]float64 `json:"scores"`
+	Critique string             `json:"critique"`
+}
+
+func parseJudgeReply(text string, dims []Dimension) (*judgeReply, error) {
+	js := extractJSON(text)
+	if js == "" {
+		return nil, fmt.Errorf("no json block found")
+	}
+	var r judgeReply
+	if err := json.Unmarshal([]byte(js), &r); err != nil {
+		return nil, fmt.Errorf("unmarshal: %w", err)
+	}
+	for _, d := range dims {
+		if _, ok := r.Scores[d.Name]; !ok {
+			return nil, fmt.Errorf("missing dimension %q in judge reply", d.Name)
+		}
+		if r.Scores[d.Name] < 0 || r.Scores[d.Name] > 1 {
+			return nil, fmt.Errorf("dimension %q out of range [0,1]: %v", d.Name, r.Scores[d.Name])
+		}
+	}
+	return &r, nil
+}
+
+func extractJSON(text string) string {
+	if i := strings.Index(text, "```json"); i >= 0 {
+		rest := text[i+len("```json"):]
+		if j := strings.Index(rest, "```"); j > 0 {
+			return strings.TrimSpace(rest[:j])
+		}
+	}
+	start := strings.Index(text, "{")
+	end := strings.LastIndex(text, "}")
+	if start >= 0 && end > start {
+		return text[start : end+1]
+	}
+	return ""
+}
+
+func buildJudgePrompt(g *Goal, files map[string]string) string {
+	var sb strings.Builder
+	sb.WriteString("You are a strict, principled judge of a methodology document.\n")
+	sb.WriteString("The candidate should be documentation/methodology, not a runnable software project.\n\n")
+	sb.WriteString("# Goal\n")
+	sb.WriteString(g.Description)
+	sb.WriteString("\n\n# Rubric\n")
+	sb.WriteString(g.LLMJudgeRubric)
+	sb.WriteString("\n\n# Dimensions\n")
+	for _, d := range g.Dimensions {
+		dir := "higher is better"
+		if !d.HigherIsBetter {
+			dir = "lower is better"
+		}
+		sb.WriteString(fmt.Sprintf("- %s (%s)\n", d.Name, dir))
+	}
+	sb.WriteString("\n# Candidate Markdown files\n")
+	if len(files) == 0 {
+		sb.WriteString("\nNo Markdown files were collected. This should score very poorly.\n")
+	}
+	for path, content := range files {
+		sb.WriteString(fmt.Sprintf("\n## %s\n```markdown\n%s\n```\n", path, truncate(content, 6000)))
+	}
+	sb.WriteString(`
+# Your task
+Output ONLY a single JSON object inside a ` + "```json" + ` fenced block:
+
+` + "```json" + `
+{
+  "scores": { "<dim_name>": <0.0-1.0>, ... },
+  "critique": "concrete, specific feedback. Point at Markdown section names or line numbers if possible. Say exactly what to change next. Penalize executable project scaffolding."
+}
+` + "```" + `
+
+The critique will be fed to the next iteration. Be useful, not polite.
+For "lower is better" dims, output the raw value; the search engine handles direction.
+`)
+	return sb.String()
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max/2] + "\n... [truncated] ...\n" + s[len(s)-max/2:]
+}
+

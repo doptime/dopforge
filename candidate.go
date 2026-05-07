@@ -11,15 +11,15 @@ import (
 )
 
 // ============================================================
-// Candidate:一份正在演化的方法论实现
+// Candidate:一份正在演化的方法论候选版本
 // ============================================================
 //
-// 一个 Candidate 等于一个独立工作目录(WorkDir),里面是真实可运行的代码。
-// 它有稳定 ID、出身记录(父代是谁)、分数(可能为 nil 表示还没评估)。
+// 一个 Candidate 等于一个独立工作目录(WorkDir),里面通常是一组 Markdown 文档,
+// 最常见的是 METHOD.md。它有稳定 ID、父代记录、分数。
 //
 // 关键不变量:
-//   - WorkDir 是一个 cp -a 出来的独立目录,自己拥有 .dopharness/ 子目录
-//   - Parent 永远指向"创造我的那一份",根候选解 Parent == nil
+//   - WorkDir 是一个 cp -a 出来的独立目录,拥有自己的 .dopharness/ 子目录
+//   - Parent 永远指向创造它的那一份,根候选解 Parent == nil
 //   - Score 在评估前为 nil,评估后不应再被改写
 
 var idCounter uint64
@@ -54,11 +54,12 @@ func NewCandidate(lineage, generation int, parent *Candidate) *Candidate {
 }
 
 // ============================================================
-// Score:多维评分向量(无标量)
+// Score:多维评分向量 + SimpleTES 风格标量代理
 // ============================================================
 //
-// 设计核心:不强行把多个维度合成一个标量。Pareto 在多维向量上比较,
-// 只在出现"严格被支配"关系时淘汰候选。
+// 设计核心:最终结果仍用 Pareto 前沿保留多目标多样性;但搜索内部需要一个稳定的
+// scalar proxy,用于 K 个兄弟之间的局部选择、日志和停滞判断。这一点对齐 SimpleTES
+// 原论文中“评估产生可比较分数”的假设,同时不牺牲方法论任务的多维评价表达。
 
 type Score struct {
 	// Hard 列出每条硬门槛的检查结果。任意 Err != nil 视为整体不通过。
@@ -67,8 +68,7 @@ type Score struct {
 	// Soft 是按 Goal.Dimensions 给出的多维分数。键名严格对齐 Dimension.Name。
 	Soft map[string]float64
 
-	// Notes 是评估器(典型是 LLM judge)给出的文字反馈。会被原样回灌进
-	// 下一轮 mutate 的 user prompt,引导改进方向。
+	// Notes 是评估器(典型是 LLM judge)给出的文字反馈。会被原样回灌进下一轮 mutate。
 	Notes string
 }
 
@@ -89,6 +89,50 @@ func (s *Score) Passed() bool {
 		}
 	}
 	return true
+}
+
+// Value returns the scalar proxy used for SimpleTES-style local selection and
+// trajectory logging. The raw evaluation remains multi-dimensional and Pareto is
+// still used for the final frontier; this scalar is only a stable search signal.
+//
+// For dimensions where HigherIsBetter=false, the value is negated. In the common
+// methodology-use case all LLM judge dimensions are normalized to [0,1] with
+// higher-is-better, so Value is simply a weighted average.
+func (s *Score) Value(dims []Dimension) float64 {
+	if s == nil || len(s.Soft) == 0 {
+		return -1e18
+	}
+	if len(dims) == 0 {
+		total := 0.0
+		n := 0.0
+		for _, v := range s.Soft {
+			total += v
+			n++
+		}
+		if n == 0 {
+			return -1e18
+		}
+		return total / n
+	}
+
+	total := 0.0
+	weightSum := 0.0
+	for _, d := range dims {
+		w := d.Weight
+		if w == 0 {
+			w = 1
+		}
+		v := s.Soft[d.Name]
+		if !d.HigherIsBetter {
+			v = -v
+		}
+		total += w * v
+		weightSum += w
+	}
+	if weightSum == 0 {
+		return total
+	}
+	return total / weightSum
 }
 
 // Dominates 判断 s 在帕累托意义上是否支配 other。
@@ -129,10 +173,9 @@ func (s *Score) Dominates(other *Score, dims []Dimension) bool {
 //
 // 设计要点:
 //   - 每个 Candidate 在磁盘上是 <Root>/L<lineage>/<id>/ 一份完整副本
-//   - fork 时 cp -a,不做 git 也不做 union mount —— 简单且对所有语言都 work
+//   - fork 时 cp -a,不做 git 也不做 union mount
 //   - 副本里包含 .dopharness/ chunk store,所以增量索引能延续
-//   - 副本里也包含 .dopharness/memory/sessions/,所以 lineage 内 L4 历史
-//     自动沿父代 → 子代继承(这是 dopharness 4 层记忆中 L4 的天然继承机制)
+//   - 副本里也包含 .dopharness/memory/sessions/,所以 lineage 内 L4 历史自动继承
 
 type Workspace struct {
 	Root    string // 例:./.forge_work
@@ -177,8 +220,7 @@ func (w *Workspace) Materialize(c *Candidate) error {
 	return nil
 }
 
-// Cleanup 删除 Candidate 的物理目录。**不要**清理还在被引用为 Parent 的候选,
-// 否则其后代失去拷贝源。search.Run 已经处理好了这一约束。
+// Cleanup 删除 Candidate 的物理目录。不要清理还在被引用为 Parent 的候选。
 func (w *Workspace) Cleanup(c *Candidate) error {
 	if c.WorkDir == "" {
 		return nil

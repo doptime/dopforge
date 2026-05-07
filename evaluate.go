@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -13,16 +17,12 @@ import (
 // 评估层:Pipeline + Stage
 // ============================================================
 //
-// 评估的核心论点是:**不强行返回标量奖励**,因为多目标评估天然是启发式的,
-// 折成单分等于把启发式偏见注入选择压力。
+// 评估的核心论点是:不强行返回标量奖励。方法论质量天然是多目标启发式判断,
+// 折成单分会把偏见注入选择压力。
 //
 // 替代方案:
-//   1) HardGate     —— 硬门槛(布尔),不通过即淘汰
+//   1) HardGate     —— 硬门槛(布尔),不通过即无法进入 Pareto 前沿
 //   2) Soft Stages  —— 多维数值(向量),Pareto 直接消费
-//
-// 这两道闸的输出共同填充 Score。后续搜索层的 Pareto 比较只用 Score 中的
-// 多维数值,**任何一处都不再合并维度**,直到最终 PickBestInBatch 在前沿
-// 多个候选间需要 tiebreak 时才用 Goal.Dimension.Weight 做加权排序。
 
 type Stage interface {
 	Name() string
@@ -30,9 +30,7 @@ type Stage interface {
 }
 
 // StageOutput 是单个 Stage 的产出。
-//
-// 任意 Stage 都可以贡献多个 Soft 维度。HardErr != nil 表示该 Stage 拒绝候选
-// (即便它不是 HardGate 本身也可以拒绝,例如评估器内部数据完整性检查失败)。
+// 任意 Stage 都可以贡献多个 Soft 维度。HardErr != nil 表示该 Stage 拒绝候选。
 type StageOutput struct {
 	HardErr error
 	Soft    map[string]float64
@@ -41,16 +39,15 @@ type StageOutput struct {
 
 // Pipeline 串联多个 Stage,产出最终 Score。
 //
-// 顺序:HardStages 先于 SoftStages。但即便 Hard 全失败,Soft 也仍会跑——
-// 这样 LLM 拿到的 Notes 里既有"为什么不通过"也有"如果通过会怎样",反馈带宽更高,
-// 加速下一轮迭代。
+// 顺序:HardStages 先于 SoftStages。但即便 Hard 失败,Soft 也仍会跑——这样 LLM
+// 拿到的 Notes 里既有“为什么不通过”,也有“如果通过该怎么变好”。
 type Pipeline struct {
 	HardStages []Stage
 	SoftStages []Stage
 	Goal       *Goal // 用于在 Soft 维度缺失时填默认值
 }
 
-// Evaluate 实现完整的四道闸评估。
+// Evaluate 实现完整评估。
 func (p *Pipeline) Evaluate(ctx context.Context, c *Candidate) (*Score, error) {
 	score := &Score{Soft: make(map[string]float64)}
 	var notes []string
@@ -70,7 +67,7 @@ func (p *Pipeline) Evaluate(ctx context.Context, c *Candidate) (*Score, error) {
 			notes = append(notes, fmt.Sprintf("[%s] %s", st.Name(), out.Notes))
 		}
 	}
-	// 维度兜底:Goal 声明的每一维都必须在 Soft 里
+
 	if p.Goal != nil {
 		for _, d := range p.Goal.Dimensions {
 			if _, ok := score.Soft[d.Name]; !ok {
@@ -119,8 +116,15 @@ func (s *hardGateStage) Run(ctx context.Context, c *Candidate) StageOutput {
 // ShellGate:开箱即用的硬门槛实现
 // ============================================================
 
-// ShellGate 跑一条 shell 命令看退出码。常见用法:`go build ./...`、`npm test`、
-// `./run.sh --self-test`。Cmd 在候选解的 WorkDir 下执行(cwd = workDir)。
+// ShellGate 跑一条 shell 命令看退出码。Cmd 在候选解的 WorkDir 下执行。
+//
+// 对方法论文档任务,建议使用确定性文件检查,例如:
+//
+//	test -f METHOD.md
+//	test ! -f go.mod && test ! -f run.sh
+//	grep -q '^##' METHOD.md
+//
+// 不建议在默认方法论任务里运行沙盒、编译或启动服务。
 type ShellGate struct {
 	GateName string
 	Cmd      []string
@@ -153,25 +157,62 @@ func (g ShellGate) Check(workDir string) error {
 }
 
 // ============================================================
+// ContentGate:纯 Go 内容硬门槛
+// ============================================================
+//
+// ContentGate 在候选 workDir 下读取一个 Markdown artifact,然后用纯 Go 函数
+// 检查内容层面的强约束(关键词必现、长度区间、bullet/段落比上限等)。
+// 比 ShellGate 更便携、更可控,且把内容 sanity 校验从 LLM judge 抽到硬门槛,
+// 显著降低 judge 噪声对搜索的影响。
+
+type ContentGate struct {
+	GateName string
+	// Artifact 是 workDir 下的相对路径;空则使用 "METHOD.md"。
+	Artifact string
+	// CheckFn 拿到读取后的全文,返回 nil 即通过。
+	CheckFn func(content string) error
+}
+
+func (g ContentGate) Name() string { return g.GateName }
+
+func (g ContentGate) Check(workDir string) error {
+	if g.CheckFn == nil {
+		return fmt.Errorf("ContentGate %q: CheckFn is nil", g.GateName)
+	}
+	name := g.Artifact
+	if name == "" {
+		name = "METHOD.md"
+	}
+	data, err := os.ReadFile(filepath.Join(workDir, name))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", name, err)
+	}
+	return g.CheckFn(string(data))
+}
+
+// ============================================================
 // LLMJudgeStage:多维 LLM 法官
 // ============================================================
 //
 // 关键设计:
-//   - 法官是一个独立 LLM,**与 mutate 用的不是同一只**。弱评估器评强生成,
-//     在搜索过程中天然形成对抗,不会被生成器的盲点带偏。
-//   - 输出是结构化 JSON:每一维一个 [0,1] 的分,加一段 critique。
-//   - 维度对齐 Goal.Dimensions 严格检查;漏维度 = 解析失败 = 该轮分数缺失。
+//   - 法官是一个独立 LLM,与 mutate 用的不是同一只
+//   - 输出是结构化 JSON:每一维一个 [0,1] 的分,加一段 critique
+//   - 维度对齐 Goal.Dimensions 严格检查;漏维度 = 解析失败 = 该轮分数缺失
 
 // JudgeCaller 是用户提供的 LLM 单点调用函数。
-//
-// 实现拿到完整 prompt,必须返回 LLM 回复文本(我们会从中提取 ```json 块)。
+// 实现拿到完整 prompt,必须返回 LLM 回复文本(我们会从中提取 JSON 块)。
 type JudgeCaller func(ctx context.Context, prompt string) (string, error)
 
 // LLMJudgeStage 是产出 Goal.Dimensions 上多维分 + Notes 的 SoftStage。
+//
+// Replicas 控制每个候选的 judge 重复采样次数;< 1 视为 1。N>=3 时,每一维取
+// N 次返回值的中位数(对 LLM judge 噪声鲁棒),Notes 选择离中位数标量最近的
+// 那次 critique,避免 outlier critique 误导下一轮 mutate。
 type LLMJudgeStage struct {
 	Goal           *Goal
 	Caller         JudgeCaller
 	FilesToInclude func(workDir string) (map[string]string, error)
+	Replicas       int
 }
 
 func (s *LLMJudgeStage) Name() string { return "llm_judge" }
@@ -185,15 +226,94 @@ func (s *LLMJudgeStage) Run(ctx context.Context, c *Candidate) StageOutput {
 		return StageOutput{Notes: fmt.Sprintf("judge: collect files: %v", err)}
 	}
 	prompt := buildJudgePrompt(s.Goal, files)
-	reply, err := s.Caller(ctx, prompt)
-	if err != nil {
-		return StageOutput{Notes: fmt.Sprintf("judge: call err: %v", err)}
+
+	n := s.Replicas
+	if n < 1 {
+		n = 1
 	}
-	parsed, err := parseJudgeReply(reply, s.Goal.Dimensions)
-	if err != nil {
-		return StageOutput{Notes: fmt.Sprintf("judge: parse err: %v\nraw: %s", err, truncate(reply, 600))}
+
+	type slot struct {
+		parsed *judgeReply
+		err    error
 	}
-	return StageOutput{Soft: parsed.Scores, Notes: parsed.Critique}
+	slots := make([]slot, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			reply, err := s.Caller(ctx, prompt)
+			if err != nil {
+				slots[i] = slot{err: fmt.Errorf("call: %w", err)}
+				return
+			}
+			parsed, err := parseJudgeReply(reply, s.Goal.Dimensions)
+			if err != nil {
+				slots[i] = slot{err: fmt.Errorf("parse: %w; raw: %s", err, truncate(reply, 400))}
+				return
+			}
+			slots[i] = slot{parsed: parsed}
+		}(i)
+	}
+	wg.Wait()
+
+	var ok []*judgeReply
+	var errs []string
+	for _, sl := range slots {
+		if sl.err != nil {
+			errs = append(errs, sl.err.Error())
+			continue
+		}
+		ok = append(ok, sl.parsed)
+	}
+	if len(ok) == 0 {
+		return StageOutput{Notes: "judge: all replicas failed: " + strings.Join(errs, " | ")}
+	}
+
+	// 每一维取 N 次的中位数
+	soft := make(map[string]float64, len(s.Goal.Dimensions))
+	for _, d := range s.Goal.Dimensions {
+		vals := make([]float64, 0, len(ok))
+		for _, r := range ok {
+			vals = append(vals, r.Scores[d.Name])
+		}
+		soft[d.Name] = median(vals)
+	}
+
+	// Notes 选离中位数标量最近的那次 critique
+	scalars := make([]float64, len(ok))
+	for i, r := range ok {
+		scalars[i] = (&Score{Soft: r.Scores}).Value(s.Goal.Dimensions)
+	}
+	medScalar := median(scalars)
+	bestIdx, bestDiff := 0, 1e18
+	for i, sc := range scalars {
+		d := sc - medScalar
+		if d < 0 {
+			d = -d
+		}
+		if d < bestDiff {
+			bestDiff, bestIdx = d, i
+		}
+	}
+	notes := ok[bestIdx].Critique
+	if len(errs) > 0 {
+		notes += fmt.Sprintf("\n\n[judge: %d/%d replicas failed]", len(errs), n)
+	}
+	return StageOutput{Soft: soft, Notes: notes}
+}
+
+func median(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	cp := append([]float64(nil), xs...)
+	sort.Float64s(cp)
+	n := len(cp)
+	if n%2 == 1 {
+		return cp[n/2]
+	}
+	return (cp[n/2-1] + cp[n/2]) / 2
 }
 
 type judgeReply struct {
@@ -213,6 +333,9 @@ func parseJudgeReply(text string, dims []Dimension) (*judgeReply, error) {
 	for _, d := range dims {
 		if _, ok := r.Scores[d.Name]; !ok {
 			return nil, fmt.Errorf("missing dimension %q in judge reply", d.Name)
+		}
+		if r.Scores[d.Name] < 0 || r.Scores[d.Name] > 1 {
+			return nil, fmt.Errorf("dimension %q out of range [0,1]: %v", d.Name, r.Scores[d.Name])
 		}
 	}
 	return &r, nil
@@ -235,7 +358,8 @@ func extractJSON(text string) string {
 
 func buildJudgePrompt(g *Goal, files map[string]string) string {
 	var sb strings.Builder
-	sb.WriteString("You are a strict, principled judge of a methodology implementation.\n\n")
+	sb.WriteString("You are a strict, principled judge of a methodology document.\n")
+	sb.WriteString("The candidate should be documentation/methodology, not a runnable software project.\n\n")
 	sb.WriteString("# Goal\n")
 	sb.WriteString(g.Description)
 	sb.WriteString("\n\n# Rubric\n")
@@ -248,9 +372,12 @@ func buildJudgePrompt(g *Goal, files map[string]string) string {
 		}
 		sb.WriteString(fmt.Sprintf("- %s (%s)\n", d.Name, dir))
 	}
-	sb.WriteString("\n# Candidate files\n")
+	sb.WriteString("\n# Candidate Markdown files\n")
+	if len(files) == 0 {
+		sb.WriteString("\nNo Markdown files were collected. This should score very poorly.\n")
+	}
 	for path, content := range files {
-		sb.WriteString(fmt.Sprintf("\n## %s\n```\n%s\n```\n", path, truncate(content, 4000)))
+		sb.WriteString(fmt.Sprintf("\n## %s\n```markdown\n%s\n```\n", path, truncate(content, 6000)))
 	}
 	sb.WriteString(`
 # Your task
@@ -259,7 +386,7 @@ Output ONLY a single JSON object inside a ` + "```json" + ` fenced block:
 ` + "```json" + `
 {
   "scores": { "<dim_name>": <0.0-1.0>, ... },
-  "critique": "concrete, specific feedback. point at file:line. say what to change next."
+  "critique": "concrete, specific feedback. Point at Markdown section names or line numbers if possible. Say exactly what to change next. Penalize executable project scaffolding."
 }
 ` + "```" + `
 
@@ -275,8 +402,3 @@ func truncate(s string, max int) string {
 	}
 	return s[:max/2] + "\n... [truncated] ...\n" + s[len(s)-max/2:]
 }
-
-// ============================================================
-// 扩展:你想加 SyntheticPlayerStage 这类自定义 Stage,实现 Stage 接口即可
-// 然后塞进 Pipeline.SoftStages 切片。dopforge 不内置——它是高度业务相关的。
-// ============================================================
